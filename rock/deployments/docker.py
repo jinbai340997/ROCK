@@ -19,7 +19,6 @@ from rock.deployments.abstract import AbstractDeployment
 from rock.deployments.config import DockerDeploymentConfig
 from rock.deployments.constants import Port, Status
 from rock.deployments.hooks.abstract import CombinedDeploymentHook, DeploymentHook
-from rock.deployments.hooks.docker_login import DockerLoginHook
 from rock.deployments.runtime_env import DockerRuntimeEnv, LocalRuntimeEnv, PipRuntimeEnv, UvRuntimeEnv
 from rock.deployments.sandbox_validator import DockerSandboxValidator
 from rock.deployments.status import PersistedServiceStatus, ServiceStatus
@@ -39,7 +38,7 @@ from rock.utils import (
     timeout,
     wait_until_alive,
 )
-from rock.utils.docker_auth import TempDockerAuth, TempDockerAuthError
+from rock.utils.docker_auth import TempAuthDockerClient, TempAuthDockerClientError
 
 __all__ = ["DockerDeployment", "DockerDeploymentConfig"]
 CHECK_CLEAR_INTERVAL_SECONDS = 300
@@ -70,8 +69,6 @@ class DockerDeployment(AbstractDeployment):
         self._check_stop_task = None
         self._container_name = None
         self._service_status = PersistedServiceStatus()
-        self._use_temp_docker_auth = self._resolve_auth_mode()
-        self._temp_docker_auth: TempDockerAuth | None = None
 
         if self._config.container_name:
             self.set_container_name(self._config.container_name)
@@ -85,16 +82,6 @@ class DockerDeployment(AbstractDeployment):
             self._runtime_env = PipRuntimeEnv(self._config.runtime_config)
         else:
             raise Exception(f"Invalid ROCK_WORKER_ENV_TYPE: {env_vars.ROCK_WORKER_ENV_TYPE}")
-
-        if not self._use_temp_docker_auth:
-            """Traditional method: Register DockerLoginHook"""
-            if self._config.registry_username is not None and self._config.registry_password is not None:
-                self.add_hook(
-                    DockerLoginHook(self._config.image, self._config.registry_username, self._config.registry_password)
-                )
-                logger.info("Using legacy DockerLoginHook (temp auth disabled)")
-        else:
-            logger.info("Using temp docker auth mode (credentials isolated)")
 
         self.sandbox_validator: DockerSandboxValidator | None = DockerSandboxValidator()
 
@@ -248,16 +235,52 @@ class DockerDeployment(AbstractDeployment):
         ]
 
     def _pull_image(self) -> None:
-        """Pull Image - Select Authentication Mode Based on Switch
+        """Pull image using temporary authentication.
 
-        The `_use_temp_docker_auth` switch determines the authentication mode used:
-            - True: Temporary authentication mode (secure, recommended)
-            - False: Traditional mode (compatible, risky)
+        Uses TempAuthDockerClient to ensure credentials are isolated
+        and automatically cleaned up after the pull operation.
         """
-        if self._use_temp_docker_auth:
-            self._pull_image_with_temp_auth()
-        else:
-            self._pull_image_legacy()
+        if self._config.pull == "never":
+            self._service_status.update_status(
+                phase_name="image_pull", status=Status.SUCCESS, message="skip image pull"
+            )
+            return
+
+        if self._config.pull == "missing" and DockerUtil.is_image_available(self._config.image):
+            self._service_status.update_status(
+                phase_name="image_pull", status=Status.SUCCESS, message="use cached image, skip image pull"
+            )
+            return
+
+        self._service_status.update_status(
+            phase_name="image_pull", status=Status.RUNNING, message="image pull running"
+        )
+        logger.info(f"Pulling image {self._config.image!r}")
+
+        try:
+            with Timer(description=f"[{self._config.image}] Image pull"):
+                # Parse registry from image name
+                registry, _ = ImageUtil.parse_registry_and_others(self._config.image)
+                
+                # Create temp auth client with credentials if available
+                with TempAuthDockerClient(
+                    registry=registry if self._config.registry_username else None,
+                    username=self._config.registry_username,
+                    password=self._config.registry_password,
+                ) as client:
+                    self._hooks.on_custom_step(DeploymentHookStep.PULLING_IMAGE)
+                    client.pull(self._config.image)
+
+            self._service_status.update_status(
+                phase_name="image_pull", status=Status.SUCCESS, message="image pull success"
+            )
+
+        except (subprocess.CalledProcessError, TempAuthDockerClientError) as e:
+            msg = f"Failed to pull image {self._config.image}: {e}"
+            self._service_status.update_status(
+                phase_name="image_pull", status=Status.FAILED, message=msg
+            )
+            raise DockerPullError(msg) from e
 
     @property
     def glibc_dockerfile(self) -> str:
@@ -359,21 +382,14 @@ class DockerDeployment(AbstractDeployment):
         executor = get_executor()
         loop = asyncio.get_running_loop()
 
-        try:
-            await loop.run_in_executor(executor, self._pull_image)
-            if self._config.python_standalone_dir is not None:
-                image_id = self._build_image()
-            else:
-                image_id = self._config.image
+        await loop.run_in_executor(executor, self._pull_image)
+        if self._config.python_standalone_dir is not None:
+            image_id = self._build_image()
+        else:
+            image_id = self._config.image
 
-            if not self.sandbox_validator.check_resource(image_id):
-                raise Exception(f"Image {image_id} is not valid")
-        except Exception:
-            """Clean up temporary authentication when an error occurs"""
-            self._cleanup_temp_docker_auth()
-            raise
-
-
+        if not self.sandbox_validator.check_resource(image_id):
+            raise Exception(f"Image {image_id} is not valid")
 
         await self.do_port_mapping()
         platform_arg = []
@@ -533,9 +549,6 @@ class DockerDeployment(AbstractDeployment):
             except subprocess.CalledProcessError:
                 logger.error(f"Failed to remove image {self._config.image}", exc_info=True)
 
-        """Clear temporary certification"""
-        self._cleanup_temp_docker_auth()
-
         if self._check_stop_task is not None:
             logger.info("Stopping check task")
             self._check_stop_task.cancel()
@@ -604,135 +617,3 @@ class DockerDeployment(AbstractDeployment):
         self._service_status.add_port_mapping(Port.SERVER, server_port)
         if self._config.port is None:
             self._config.port = proxy_port
-
-    def _resolve_auth_mode(self) -> bool:
-        """Parsing Authentication Mode Configuration
-
-        Priority (from highest to lowest):
-            1. Environment variable ROCK_DOCKER_TEMP_AUTH
-            2. Configuration parameter use_temp_docker_auth
-            3. Default value True
-
-        Returns:
-            True: Use temporary authentication (secure mode)
-            False: Use traditional authentication (compatibility mode)
-        """
-
-        if "ROCK_DOCKER_TEMP_AUTH" in os.environ:
-            env_value = os.getenv("ROCK_DOCKER_TEMP_AUTH", "true").lower()
-            enabled = env_value in ("true", "1", "yes", "on")
-            logger.info(f"Auth mode from env ROCK_DOCKER_TEMP_AUTH: {enabled}")
-            return enabled
-
-        if hasattr(self._config, 'use_temp_docker_auth') and self._config.use_temp_docker_auth is not None:
-            logger.info(f"Auth mode from config: {self._config.use_temp_docker_auth}")
-            return self._config.use_temp_docker_auth
-
-        logger.info("Auth mode default: True (temp auth enabled)")
-
-        return True
-
-    def _init_temp_docker_auth(self) -> None:
-        """Initialize temporary Docker authentication configuration"""
-        if self._use_temp_docker_auth and self._config.registry_username and self._config.registry_password:
-            self._temp_docker_auth = TempDockerAuth()
-            self._temp_docker_auth.create()
-            logger.info(f"Initialized temp docker auth: {self._temp_docker_auth.temp_dir}")
-
-    def _cleanup_temp_docker_auth(self) -> None:
-        """Clean up temporary Docker authentication configuration"""
-        if self._temp_docker_auth:
-            self._temp_docker_auth.cleanup()
-            self._temp_docker_auth = None
-            logger.info("Cleaned up temp docker auth")
-
-    def _pull_image_with_temp_auth(self) -> None:
-        """Pull the image using temporary authentication (safe mode)"""
-        if self._config.pull == "never":
-            self._service_status.update_status(
-                phase_name="image_pull", status=Status.SUCCESS, message="skip image pull"
-            )
-            return
-
-        if self._config.pull == "missing" and DockerUtil.is_image_available(self._config.image):
-            self._service_status.update_status(
-                phase_name="image_pull", status=Status.SUCCESS, message="use cached image, skip image pull"
-            )
-            return
-
-        self._service_status.update_status(
-            phase_name="image_pull", status=Status.RUNNING, message="image pull running"
-        )
-        logger.info(f"Pulling image {self._config.image!r} with temp auth")
-
-        self._init_temp_docker_auth()
-
-        try:
-            with Timer(description=f"[{self._config.image}] Image pull with temp auth"):
-                registry, _ = ImageUtil.parse_registry_and_others(self._config.image)
-                """If have credentials, log in first."""
-                if self._temp_docker_auth and registry and self._config.registry_username and self._config.registry_password:
-                    self._temp_docker_auth.login(
-                        registry,
-                        self._config.registry_username,
-                        self._config.registry_password
-                    )
-                    self._hooks.on_custom_step(DeploymentHookStep.PULLING_IMAGE)
-                """Pull image."""
-                if self._temp_docker_auth:
-                    self._temp_docker_auth.pull(self._config.image)
-                else:
-                    DockerUtil.pull_image(self._config.image)
-
-            self._service_status.update_status(
-                phase_name="image_pull", status=Status.SUCCESS, message="image pull success"
-            )
-
-        except (subprocess.CalledProcessError, TempDockerAuthError) as e:
-            msg = f"Failed to pull image {self._config.image}: {e}"
-            self._service_status.update_status(
-                phase_name="image_pull", status=Status.FAILED, message=msg
-            )
-            raise DockerPullError(msg) from e
-        finally:
-            self._cleanup_temp_docker_auth()
-
-    def _pull_image_legacy(self) -> None:
-        """Pulling the image using the traditional method (backward compatibility mode)
-
-        Warning: This mode has concurrency security risks; credentials are persisted to ~/.docker/config.json
-        """
-        logger.warning("Using legacy auth mode (concurrency risks, credentials may persist)")
-
-        if self._config.pull == "never":
-            self._service_status.update_status(
-                phase_name="image_pull", status=Status.SUCCESS, message="skip image pull"
-            )
-            return
-
-        if self._config.pull == "missing" and DockerUtil.is_image_available(self._config.image):
-            self._service_status.update_status(
-                phase_name="image_pull", status=Status.SUCCESS, message="use cached image, skip image pull"
-            )
-            return
-
-        self._service_status.update_status(
-            phase_name="image_pull", status=Status.RUNNING, message="image pull running"
-        )
-        logger.info(f"Pulling image {self._config.image!r} (legacy mode)")
-
-        try:
-            with Timer(description=f"[{self._config.image}] Image pull"):
-                self._hooks.on_custom_step(DeploymentHookStep.PULLING_IMAGE)
-                DockerUtil.pull_image(self._config.image)
-            self._service_status.update_status(
-                phase_name="image_pull", status=Status.SUCCESS, message="image pull success"
-            )
-
-        except subprocess.CalledProcessError as e:
-            msg = f"Failed to pull image {self._config.image}. "
-            msg += f"Error: {e.stderr.decode() if e.stderr else 'Unknown'}"
-            self._service_status.update_status(
-                phase_name="image_pull", status=Status.FAILED, message=msg
-            )
-            raise DockerPullError(msg) from e

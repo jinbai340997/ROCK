@@ -1,3 +1,13 @@
+"""
+Docker temporary authentication client.
+
+This module provides TempAuthDockerClient - a context manager for isolated Docker
+authentication that uses temporary configuration directories to ensure:
+1. Credentials do not pollute the user's ~/.docker/config.json
+2. Credentials are completely isolated per sandbox
+3. Automatic cleanup - credentials are not persistent
+"""
+
 import logging
 import shutil
 import subprocess
@@ -11,60 +21,98 @@ from rock import env_vars
 logger = logging.getLogger(__name__)
 
 
-
-class TempDockerAuthError(Exception):
-    """Docker temporary authentication scheme exception types"""
+class TempAuthDockerClientError(Exception):
+    """Exception raised for Docker temporary authentication errors."""
     pass
 
 
-class TempDockerAuth:
-    """Docker temp auth manager
+class TempAuthDockerClient:
+    """Docker client with temporary authentication configuration.
 
-    Use a separate temporary configuration directory for Docker login/pull to ensure:
-    1. Credentials do not pollute the user's home directory's `~/.docker/config.json` file.
-    2. Credentials are completely isolated within each sandbox.
-    3. Automatic cleanup; credentials are not persistent.
+    A context manager that provides isolated Docker operations using a temporary
+    configuration directory. This ensures credentials are isolated per sandbox
+    and automatically cleaned up.
+
+    Usage:
+        with TempAuthDockerClient(
+            registry="registry.example.com",
+            username="user",
+            password="pass"
+        ) as client:
+            client.pull("registry.example.com/image:v1")
+            if client.is_image_available("registry.example.com/image:v1"):
+                print("Image pulled successfully")
+        # Temporary directory and credentials are automatically cleaned up
+
+    Or without credentials (for public images):
+        with TempAuthDockerClient() as client:
+            client.pull("python:3.11")
     """
 
-    def __init__(self, base_dir: str | None = None):
-        """init
+    def __init__(
+        self,
+        registry: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        base_dir: str | None = None,
+    ):
+        """Initialize the temporary Docker client.
 
         Args:
-            base_dir: The parent directory of the temporary directory is the system temporary directory (/tmp) by default.
+            registry: Docker registry URL (e.g., registry.example.com).
+                     Required if username/password are provided.
+            username: Registry username for authentication.
+            password: Registry password for authentication.
+            base_dir: Parent directory for the temporary config directory.
+                     Defaults to ROCK_DOCKER_TEMP_AUTH_DIR env var or system temp.
         """
+        self._registry = registry
+        self._username = username
+        self._password = password
         self._base_dir = base_dir or env_vars.ROCK_DOCKER_TEMP_AUTH_DIR
         self._temp_dir: Path | None = None
+        self._logged_in = False
 
     @property
     def temp_dir(self) -> Path | None:
-        """Get the temporary directory path"""
+        """Get the temporary directory path."""
         return self._temp_dir
 
     @property
     def config_path(self) -> Path | None:
-        """Get the temporary config.json path"""
+        """Get the temporary config.json path."""
         if self._temp_dir:
             return self._temp_dir / "config.json"
         return None
 
-    def create(self) -> Path:
-        """Create a temporary configuration directory
+    def __enter__(self) -> "TempAuthDockerClient":
+        """Create temporary directory and optionally login to registry."""
+        self._create_temp_dir()
+        
+        # Perform login if credentials are provided
+        if self._registry and self._username and self._password:
+            self._login()
+        
+        return self
 
-        Returns:
-            Temporary directory path
-        """
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Clean up temporary directory."""
+        self._cleanup()
+        return None  # Don't suppress exceptions
+
+    def _create_temp_dir(self) -> None:
+        """Create the temporary configuration directory."""
         prefix = "rock_docker_auth_"
         if self._base_dir:
             Path(self._base_dir).mkdir(parents=True, exist_ok=True)
             self._temp_dir = Path(tempfile.mkdtemp(prefix=prefix, dir=self._base_dir))
         else:
             self._temp_dir = Path(tempfile.mkdtemp(prefix=prefix))
-
+        
         logger.debug(f"Created temp docker config dir: {self._temp_dir}")
-        return self._temp_dir
 
-    def cleanup(self) -> None:
-        """Clean up the temporary configuration directory and return a success/failure status."""
+    def _cleanup(self) -> None:
+        """Clean up the temporary configuration directory."""
         if self._temp_dir:
             if self._temp_dir.exists():
                 try:
@@ -72,71 +120,64 @@ class TempDockerAuth:
                     logger.debug(f"Cleaned up temp docker config dir: {self._temp_dir}")
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp docker config dir: {e}")
-            """Even if deletion fails, it indicates "this directory is no longer managed," avoiding duplicate operations and status confusion."""
+            # Clear reference even if deletion failed
             self._temp_dir = None
+            self._logged_in = False
 
-    def login(self, registry: str, username: str, password: str, timeout: int = 30) -> None:
-        """Login to a Docker registry
-
-        Args:
-            registry: Docker registry URL (e.g. registry.example.com)
-            username: Registry username
-            password: Registry password
-            timeout: Command timeout in seconds
-
-        Returns:
-            Command output as string on success
-
-        Raises:
-            TempDockerAuthError: If login fails
-        """
+    def _login(self) -> None:
+        """Login to the Docker registry."""
         if not self._temp_dir:
-            raise TempDockerAuthError("Temp dir not created. Call create() first.")
+            raise TempAuthDockerClientError("Temp dir not created. Use as context manager.")
+        
+        if not self._registry or not self._username or not self._password:
+            raise TempAuthDockerClientError("Registry, username, and password required for login.")
+        
         try:
             result = subprocess.run(
                 [
                     "docker",
                     "--config", str(self._temp_dir),
                     "login",
-                    registry,
-                    "-u", username,
+                    self._registry,
+                    "-u", self._username,
                     "--password-stdin"
                 ],
-                input=password,
+                input=self._password,
                 capture_output=True,
                 text=True,
-                timeout=timeout,
+                timeout=30,
             )
 
             if result.returncode != 0:
                 error_msg = f"Docker login failed: {result.stderr.strip()}"
                 logger.error(error_msg)
-                raise TempDockerAuthError(error_msg)
+                raise TempAuthDockerClientError(error_msg)
 
-            logger.info(f"Successfully logged in to {registry} using temp config")
+            self._logged_in = True
+            logger.info(f"Successfully logged in to {self._registry} using temp config")
         except subprocess.TimeoutExpired:
-            raise TempDockerAuthError(f"Docker login timed out after {timeout}s")
-        except TempDockerAuthError:
+            raise TempAuthDockerClientError("Docker login timed out after 30s")
+        except TempAuthDockerClientError:
             raise
         except Exception as e:
-            raise TempDockerAuthError(f"Docker login error: {e}")
-
+            raise TempAuthDockerClientError(f"Docker login error: {e}")
 
     def pull(self, image: str, timeout: int = 600) -> bytes:
-        """Pulling the image using a temporary configuration directory
+        """Pull a Docker image.
 
         Args:
-            image: Image name
-            timeout: Timeout (seconds)
+            image: Image name to pull (e.g., "python:3.11" or "registry.example.com/app:v1")
+            timeout: Timeout in seconds (default: 600s = 10 minutes)
 
         Returns:
-            Command output
+            Command stdout as bytes
 
         Raises:
-            TempDockerAuthError: Pull failed
+            TempAuthDockerClientError: If pull fails
         """
         if not self._temp_dir:
-            raise TempDockerAuthError("Temp dir not created. Call create() first.")
+            raise TempAuthDockerClientError("Temp dir not created. Use as context manager.")
+        
         try:
             result = subprocess.run(
                 [
@@ -150,28 +191,29 @@ class TempDockerAuth:
             )
             if result.returncode != 0:
                 stderr = result.stderr.decode('utf-8', errors='replace')
-                raise TempDockerAuthError(f"Docker pull failed: {stderr}")
+                raise TempAuthDockerClientError(f"Docker pull failed: {stderr}")
 
             logger.info(f"Successfully pulled image {image} using temp config")
             return result.stdout
         except subprocess.TimeoutExpired:
-            raise TempDockerAuthError(f"Docker pull timed out after {timeout}s")
-        except TempDockerAuthError:
+            raise TempAuthDockerClientError(f"Docker pull timed out after {timeout}s")
+        except TempAuthDockerClientError:
             raise
         except Exception as e:
-            raise TempDockerAuthError(f"Docker pull error: {e}")
+            raise TempAuthDockerClientError(f"Docker pull error: {e}")
 
     def is_image_available(self, image: str) -> bool:
-        """Check if the image is available (using temporary configuration).
+        """Check if an image is available locally.
 
         Args:
-            image: Image name
+            image: Image name to check
 
         Returns:
-            True if image is available locally, False otherwise
+            True if image is available, False otherwise
         """
         if not self._temp_dir:
             return False
+        
         try:
             subprocess.check_call(
                 [
@@ -188,19 +230,26 @@ class TempDockerAuth:
         except subprocess.CalledProcessError:
             return False
 
+    @property
+    def logged_in(self) -> bool:
+        """Check if client has logged in to a registry."""
+        return self._logged_in
+
+
 @contextmanager
 def temp_docker_auth_context(
     registry: str | None = None,
     username: str | None = None,
     password: str | None = None,
     base_dir: str | None = None
-) -> Generator[TempDockerAuth, None, None]:
-    """Temporary Docker Authentication Context Manager
+) -> Generator[TempAuthDockerClient, None, None]:
+    """Context manager factory for TempAuthDockerClient.
 
-    Example Usage:
-        with temp_docker_auth_context("registry.com", "user", "pass") as auth:
-            auth.pull("registry.com/app:v1")
-        # Automatically clean up the temporary directory
+    This is provided for backward compatibility and convenience.
+
+    Usage:
+        with temp_docker_auth_context("registry.com", "user", "pass") as client:
+            client.pull("registry.com/app:v1")
 
     Args:
         registry: Registry address (optional)
@@ -209,13 +258,17 @@ def temp_docker_auth_context(
         base_dir: Parent directory of the temporary directory (optional)
 
     Yields:
-        TempDockerAuth Instance
+        TempAuthDockerClient instance
     """
-    auth = TempDockerAuth(base_dir=base_dir)
-    try:
-        auth.create()
-        if registry and username and password:
-            auth.login(registry, username, password)
-        yield auth
-    finally:
-        auth.cleanup()
+    with TempAuthDockerClient(
+        registry=registry,
+        username=username,
+        password=password,
+        base_dir=base_dir
+    ) as client:
+        yield client
+
+
+# Backward compatibility alias
+TempDockerAuth = TempAuthDockerClient
+TempDockerAuthError = TempAuthDockerClientError
