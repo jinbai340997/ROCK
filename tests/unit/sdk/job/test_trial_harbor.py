@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock
 
-# Pre-import bench to avoid circular-import pitfalls in rock.sdk.job.config
-import rock.sdk.bench  # noqa: F401
 from rock.sdk.bench.models.job.config import HarborJobConfig
 from rock.sdk.job.trial.harbor import HarborTrial
 from rock.sdk.job.trial.registry import _create_trial
@@ -42,22 +40,6 @@ class TestHarborTrialBuild:
         script = trial.build()
         assert "#!/bin/bash" in script
         assert "set -e" in script
-
-    def test_build_with_setup_commands_includes_them(self):
-        cfg = HarborJobConfig(
-            job_name="test",
-            experiment_id="exp-1",
-            setup_commands=["pip install harbor"],
-        )
-        trial = HarborTrial(cfg)
-        script = trial.build()
-        assert "pip install harbor" in script
-
-    def test_build_without_setup_commands_uses_placeholder(self):
-        cfg = HarborJobConfig(job_name="test", experiment_id="exp-1")
-        trial = HarborTrial(cfg)
-        script = trial.build()
-        assert "No setup commands" in script
 
 
 # ---------------------------------------------------------------------------
@@ -173,17 +155,17 @@ class TestHarborTrialOnSandboxReady:
 
         assert cfg.namespace == "sb-ns"
 
-    async def test_experiment_id_mismatch_raises(self):
-        import pytest
-
-        cfg = HarborJobConfig(experiment_id="exp-1")
+    async def test_experiment_id_config_takes_priority_over_sandbox(self):
+        """Config experiment_id overrides sandbox's different value — no error raised."""
+        cfg = HarborJobConfig(experiment_id="claw-eval")
         trial = HarborTrial(cfg)
         sandbox = MagicMock()
         sandbox._namespace = None
-        sandbox._experiment_id = "exp-DIFFERENT"
+        sandbox._experiment_id = "default"
 
-        with pytest.raises(ValueError, match="experiment_id mismatch"):
-            await trial.on_sandbox_ready(sandbox)
+        await trial.on_sandbox_ready(sandbox)
+
+        assert cfg.experiment_id == "claw-eval"
 
     async def test_namespace_mismatch_raises(self):
         import pytest

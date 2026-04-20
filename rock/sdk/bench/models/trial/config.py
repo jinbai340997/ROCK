@@ -6,7 +6,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from rock.sdk.bench.models.environment_type import EnvironmentType
-from rock.sdk.sandbox.config import SandboxConfig
+from rock.sdk.envhub import EnvironmentConfig as _EnvConfig
+from rock.sdk.envhub.config import OssMirrorConfig
 
 
 class AgentConfig(BaseModel):
@@ -18,21 +19,6 @@ class AgentConfig(BaseModel):
     max_timeout_sec: float | None = None
     kwargs: dict[str, Any] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
-
-
-class OssMirrorConfig(BaseModel):
-    """OSS artifact mirror configuration (credentials and bucket only).
-
-    ``namespace`` / ``experiment_id`` belong on :class:`~rock.sdk.agent.models.job.config.JobConfig`
-    as top-level Harbor fields, not inside ``oss_mirror``.
-    """
-
-    enabled: bool = False
-    oss_bucket: str | None = None
-    oss_access_key_id: str | None = None
-    oss_access_key_secret: str | None = None
-    oss_region: str | None = None
-    oss_endpoint: str | None = None
 
 
 class EnvironmentConfig(BaseModel):
@@ -52,21 +38,15 @@ class EnvironmentConfig(BaseModel):
     kwargs: dict[str, Any] = Field(default_factory=dict)
 
 
-class RockEnvironmentConfig(SandboxConfig, EnvironmentConfig):
+class RockEnvironmentConfig(_EnvConfig, EnvironmentConfig):
     """Unified Rock environment config.
 
-    Combines sandbox lifecycle fields (image, memory, cpus, ...) with
-    harbor environment fields (force_build, override_cpus, ...) in a single
-    flat block. Rock-specific fields are stripped when serializing to Harbor
-    YAML via to_harbor_environment().
+    Combines job environment fields (uploads, env)
+    from JobEnvironmentConfig with harbor environment fields (force_build,
+    override_cpus, oss_mirror, etc.) from EnvironmentConfig.
+    Rock-specific fields are stripped when serializing to Harbor YAML
+    via to_harbor_environment().
     """
-
-    setup_commands: list[str] = Field(default_factory=list)
-    file_uploads: list[tuple[str, str]] = Field(
-        default_factory=list,
-        description="Files/dirs to upload before running: [(local_path, sandbox_path), ...]",
-    )
-    auto_stop: bool = False
 
     def to_harbor_environment(self) -> dict:
         """Return only harbor-native environment fields, discarding Rock-only fields.

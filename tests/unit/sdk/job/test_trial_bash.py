@@ -6,8 +6,10 @@ import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-# Import bench first to avoid circular-import pitfall in rock.sdk.job.config
-import rock.sdk.bench  # noqa: F401
+import pytest
+
+from rock.sdk.envhub import EnvironmentConfig
+from rock.sdk.envhub.config import OssMirrorConfig
 from rock.sdk.job.config import BashJobConfig
 from rock.sdk.job.trial.bash import BashTrial
 from rock.sdk.job.trial.registry import _create_trial
@@ -28,31 +30,12 @@ class TestBashTrialBuild:
     def test_build_basic_script(self):
         cfg = BashJobConfig(script="echo hello")
         trial = BashTrial(cfg)
-        out = trial.build()
-        assert "#!/bin/bash" in out
-        assert "set -e" in out
-        assert "echo hello" in out
+        assert trial.build() == "echo hello"
 
-    def test_build_with_setup_commands(self):
-        cfg = BashJobConfig(
-            setup_commands=["pip install -r requirements.txt"],
-            script="python main.py",
-        )
+    def test_build_empty_script(self):
+        cfg = BashJobConfig(script=None)
         trial = BashTrial(cfg)
-        out = trial.build()
-
-        assert "pip install -r requirements.txt" in out
-        assert "python main.py" in out
-        # Setup comes before main script
-        assert out.index("pip install -r requirements.txt") < out.index("python main.py")
-
-    def test_build_no_script_only_setup(self):
-        cfg = BashJobConfig(setup_commands=["echo setup"])
-        trial = BashTrial(cfg)
-        out = trial.build()
-        assert "#!/bin/bash" in out
-        assert "set -e" in out
-        assert "echo setup" in out
+        assert trial.build() == ""
 
 
 # ---------------------------------------------------------------------------
@@ -61,10 +44,16 @@ class TestBashTrialBuild:
 
 
 class TestBashTrialSetup:
-    async def test_setup_uploads_files(self):
+    async def test_setup_uploads_dirs(self, tmp_path):
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
         cfg = BashJobConfig(
             script="echo hi",
-            file_uploads=[("/local/a", "/sandbox/a"), ("/local/b", "/sandbox/b")],
+            environment=EnvironmentConfig(
+                uploads=[(str(dir_a), "/sandbox/a"), (str(dir_b), "/sandbox/b")],
+            ),
         )
         trial = BashTrial(cfg)
         mock_sandbox = AsyncMock()
@@ -73,8 +62,6 @@ class TestBashTrialSetup:
         await trial.setup(mock_sandbox)
 
         assert mock_sandbox.fs.upload_dir.call_count == 2
-        mock_sandbox.fs.upload_dir.assert_any_call(source_dir="/local/a", target_dir="/sandbox/a")
-        mock_sandbox.fs.upload_dir.assert_any_call(source_dir="/local/b", target_dir="/sandbox/b")
 
     async def test_setup_reads_script_path(self):
         expected = "expected content"
@@ -156,21 +143,19 @@ class TestBashTrialOnSandboxReady:
         assert cfg.namespace == "sb-ns"
         assert cfg.experiment_id == "exp-1"
 
-    async def test_experiment_id_mismatch_raises(self):
-        import pytest
-
-        cfg = BashJobConfig(script="echo hi", experiment_id="exp-1")
+    async def test_experiment_id_config_takes_priority_over_sandbox(self):
+        """Config experiment_id overrides sandbox's different value — no error raised."""
+        cfg = BashJobConfig(script="echo hi", experiment_id="claw-eval")
         trial = BashTrial(cfg)
         sandbox = MagicMock()
         sandbox._namespace = None
-        sandbox._experiment_id = "exp-DIFFERENT"
+        sandbox._experiment_id = "default"
 
-        with pytest.raises(ValueError, match="experiment_id mismatch"):
-            await trial.on_sandbox_ready(sandbox)
+        await trial.on_sandbox_ready(sandbox)
+
+        assert cfg.experiment_id == "claw-eval"
 
     async def test_namespace_mismatch_raises(self):
-        import pytest
-
         cfg = BashJobConfig(script="echo hi", namespace="cfg-ns")
         trial = BashTrial(cfg)
         sandbox = MagicMock()
@@ -179,3 +164,96 @@ class TestBashTrialOnSandboxReady:
 
         with pytest.raises(ValueError, match="namespace mismatch"):
             await trial.on_sandbox_ready(sandbox)
+
+
+# ---------------------------------------------------------------------------
+# OSS mirror integration
+# ---------------------------------------------------------------------------
+
+
+def _oss_sandbox(ns="ns", exp="exp"):
+    """Minimal sandbox mock with oss_mirror support."""
+    sb = AsyncMock()
+    sb._namespace = ns
+    sb._experiment_id = exp
+    sb.arun = AsyncMock(return_value=MagicMock(exit_code=0, output=""))
+    sb.fs.ensure_ossutil = AsyncMock(return_value=True)
+    sb.fs.upload_dir = AsyncMock(return_value=MagicMock(exit_code=0))
+    return sb
+
+
+_MIRROR = OssMirrorConfig(enabled=True, oss_bucket="b", oss_endpoint="ep", oss_region="rg")
+
+
+class TestBashTrialOssMirror:
+    async def test_setup_installs_ossutil_and_creates_dir(self):
+        cfg = BashJobConfig(
+            script="echo",
+            job_name="j",
+            namespace="ns",
+            experiment_id="exp",
+            environment=EnvironmentConfig(oss_mirror=_MIRROR),
+        )
+        trial = BashTrial(cfg)
+        sb = _oss_sandbox()
+        await trial.setup(sb)
+
+        sb.fs.ensure_ossutil.assert_called_once()
+        # Initial upload to create OSS path before script runs
+        setup_cp_calls = [c for c in sb.arun.call_args_list if "ossutil cp" in str(c)]
+        assert len(setup_cp_calls) == 1
+
+    async def test_setup_skips_when_no_mirror(self):
+        trial = BashTrial(BashJobConfig(script="echo"))
+        sb = _oss_sandbox()
+        await trial.setup(sb)
+        sb.fs.ensure_ossutil.assert_not_called()
+
+    async def test_collect_uploads(self):
+        cfg = BashJobConfig(
+            script="echo",
+            job_name="j",
+            namespace="ns",
+            experiment_id="exp",
+            environment=EnvironmentConfig(oss_mirror=_MIRROR),
+        )
+        trial = BashTrial(cfg)
+        sb = _oss_sandbox()
+        await trial.setup(sb)
+        await trial.collect(sb, "ok", 0)
+
+        # setup + collect each call ossutil cp once
+        arun_calls = [c for c in sb.arun.call_args_list if "ossutil cp" in str(c)]
+        assert len(arun_calls) == 2
+        assert all("oss://b/artifacts/ns/exp/j/" in str(c) for c in arun_calls)
+
+    async def test_upload_failure_does_not_fail_job(self):
+        cfg = BashJobConfig(
+            script="echo",
+            job_name="j",
+            namespace="ns",
+            experiment_id="exp",
+            environment=EnvironmentConfig(oss_mirror=_MIRROR),
+        )
+        trial = BashTrial(cfg)
+        sb = _oss_sandbox()
+        sb.arun = AsyncMock(return_value=MagicMock(exit_code=1, output="err"))
+        await trial.setup(sb)
+        result = await trial.collect(sb, "ok", 0)
+        assert result.exit_code == 0 and result.exception_info is None
+
+    async def test_skips_upload_when_ossutil_not_ready(self):
+        cfg = BashJobConfig(
+            script="echo",
+            job_name="j",
+            namespace="ns",
+            experiment_id="exp",
+            environment=EnvironmentConfig(oss_mirror=_MIRROR),
+        )
+        trial = BashTrial(cfg)
+        sb = _oss_sandbox()
+        sb.fs.ensure_ossutil = AsyncMock(return_value=False)
+        await trial.setup(sb)
+        await trial.collect(sb, "ok", 0)
+        ossutil_calls = [c for c in sb.arun.call_args_list if "ossutil cp" in str(c)]
+        assert len(ossutil_calls) == 0

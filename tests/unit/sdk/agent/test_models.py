@@ -234,10 +234,8 @@ class TestHarborJobConfig:
 
     def test_environment_defaults(self):
         cfg = HarborJobConfig(experiment_id="test-exp")
-        assert cfg.environment.setup_commands == []
-        assert cfg.environment.file_uploads == []
+        assert cfg.environment.uploads == []
         assert cfg.environment.env == {}
-        assert cfg.environment.auto_stop is False
 
     def test_with_full_config(self):
         cfg = HarborJobConfig(
@@ -246,13 +244,11 @@ class TestHarborJobConfig:
             n_attempts=2,
             agents=[AgentConfig(name="terminus-2", model_name="hosted_vllm/m")],
             datasets=[RegistryDatasetConfig(registry=RemoteRegistryInfo(), name="terminal-bench", version="2.0")],
-            environment=RockEnvironmentConfig(setup_commands=["pip install harbor"]),
         )
         assert cfg.job_name == "test-job"
         assert cfg.n_attempts == 2
         assert len(cfg.agents) == 1
         assert cfg.agents[0].name == "terminus-2"
-        assert cfg.environment.setup_commands == ["pip install harbor"]
 
 
 class TestPublicAPI:

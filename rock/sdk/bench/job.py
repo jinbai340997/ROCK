@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import uuid
+from pathlib import Path
 
 from rock.actions import Command, CreateBashSessionRequest, ReadFileRequest
 from rock.logger import init_logger
@@ -44,9 +45,6 @@ fi
 # ── Ensure output directory exists ──────────────────────────────────
 mkdir -p {user_defined_dir}
 
-# ── Setup commands ───────────────────────────────────────────────────
-{setup_commands}
-
 # ── Harbor run ───────────────────────────────────────────────────────
 harbor jobs start -c {config_path}
 """
@@ -55,7 +53,7 @@ harbor jobs start -c {config_path}
 class Job:
     """Execute Harbor benchmark tasks inside ROCK sandboxes.
 
-    Unifies setup_commands + harbor run into a single bash script, executed
+    Unifies harbor run into a single bash script, executed
     via the sandbox nohup protocol:
     - ``run()``: Full lifecycle (blocking wait)
     - ``submit()``: Start and return job_id immediately
@@ -110,33 +108,28 @@ class Job:
         if self._pid is None or self._tmp_file is None:
             raise RuntimeError("No submitted job to wait for. Call submit() first.")
 
-        try:
-            success, message = await self._sandbox.wait_for_process_completion(
-                pid=self._pid,
-                session=self._session,
-                wait_timeout=self._get_wait_timeout(),
-                wait_interval=CHECK_INTERVAL,
-            )
+        success, message = await self._sandbox.wait_for_process_completion(
+            pid=self._pid,
+            session=self._session,
+            wait_timeout=self._get_wait_timeout(),
+            wait_interval=CHECK_INTERVAL,
+        )
 
-            obs = await self._sandbox.handle_nohup_output(
-                tmp_file=self._tmp_file,
-                session=self._session,
-                success=success,
-                message=message,
-                ignore_output=False,
-                response_limited_bytes_in_nohup=None,
-            )
+        obs = await self._sandbox.handle_nohup_output(
+            tmp_file=self._tmp_file,
+            session=self._session,
+            success=success,
+            message=message,
+            ignore_output=False,
+            response_limited_bytes_in_nohup=None,
+        )
 
-            result = await self._collect_results()
-            result.raw_output = obs.output if obs else ""
-            result.exit_code = obs.exit_code if obs else 1
-            if not success:
-                result.status = JobStatus.FAILED
-            return result
-
-        finally:
-            if self._config.environment.auto_stop and self._sandbox:
-                await self._sandbox.close()
+        result = await self._collect_results()
+        result.raw_output = obs.output if obs else ""
+        result.exit_code = obs.exit_code if obs else 1
+        if not success:
+            result.status = JobStatus.FAILED
+        return result
 
     async def cancel(self):
         """Cancel a running job by killing the process."""
@@ -170,9 +163,13 @@ class Job:
         await self._create_session()
 
         # 1. Upload user-specified files/dirs
-        for local_path, sandbox_path in self._config.environment.file_uploads:
+        for local_path, sandbox_path in self._config.environment.uploads:
             logger.info(f"Uploading {local_path} -> {sandbox_path}")
-            await self._sandbox.fs.upload_dir(local_path, sandbox_path)
+            src = Path(local_path)
+            if src.is_file():
+                await self._sandbox.upload_by_path(file_path=local_path, target_path=sandbox_path)
+            else:
+                await self._sandbox.fs.upload_dir(local_path, sandbox_path)
 
         # 2. Upload harbor config YAML + run script
         config_path = f"{USER_DEFINED_LOGS}/rock_job_{self._config.job_name}.yaml"
@@ -196,16 +193,8 @@ class Job:
         )
 
     def _render_run_script(self, config_path: str) -> str:
-        """Render the run script (dockerd + setup_commands + harbor run)."""
-        # Setup commands
-        setup_lines = []
-        for cmd in self._config.environment.setup_commands:
-            setup_lines.append(f"echo '>>> {cmd[:60]}...'")
-            setup_lines.append(cmd)
-        setup_block = "\n".join(setup_lines) if setup_lines else "echo 'No setup commands'"
-
+        """Render the run script (dockerd + harbor run)."""
         return _RUN_SCRIPT_TEMPLATE.format(
-            setup_commands=setup_block,
             config_path=config_path,
             user_defined_dir=USER_DEFINED_LOGS,
         )
@@ -285,6 +274,8 @@ class Job:
 
         If job_name is None, generate one with the format:
         {dataset_name}_{task_name if single task}_{uuid}
+
+        For dataset_name and task_name, only the last segment after "/" is used.
         """
         if self._config.job_name is not None:
             # User has set a custom job_name, keep it
@@ -297,12 +288,16 @@ class Job:
         if self._config.datasets:
             dataset = self._config.datasets[0]
             if hasattr(dataset, "name") and dataset.name:
-                parts.append(dataset.name)
+                # Only use the last segment after "/"
+                dataset_name = dataset.name.rsplit("/", 1)[-1]
+                parts.append(dataset_name)
 
             # Get task name if there's only one task
             task_names = dataset.task_names
             if task_names and len(task_names) == 1:
-                parts.append(task_names[0])
+                # Only use the last segment after "/"
+                task_name = task_names[0].rsplit("/", 1)[-1]
+                parts.append(task_name)
 
         # Add short UUID (8 characters)
         parts.append(uuid.uuid4().hex[:8])

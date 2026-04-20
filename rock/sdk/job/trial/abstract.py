@@ -1,11 +1,12 @@
 """Trial abstract base class — three-phase interface (setup / build / collect).
 
-Trial 对象不管理 sandbox 生命周期；生命周期由 JobExecutor 负责。
+Trial objects do not manage sandbox lifecycle; lifecycle is managed by JobExecutor.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 class AbstractTrial(ABC):
     """Trial base: three-phase interface (setup/build/collect).
 
-    Trial 不管理 sandbox 生命周期 (由 JobExecutor 负责)。
+    Trial does not manage sandbox lifecycle (managed by JobExecutor).
     """
 
     def __init__(self, config: JobConfig):
@@ -43,12 +44,9 @@ class AbstractTrial(ABC):
 
         sb_exp = getattr(sandbox, "_experiment_id", None)
         if sb_exp is not None:
-            if self._config.experiment_id is not None and self._config.experiment_id != sb_exp:
-                raise ValueError(
-                    f"experiment_id mismatch: {type(self._config).__name__} has "
-                    f"'{self._config.experiment_id}', but sandbox returned '{sb_exp}'"
-                )
-            self._config.experiment_id = sb_exp
+            if self._config.experiment_id is None:
+                self._config.experiment_id = sb_exp
+            # If config already has experiment_id, it takes priority over sandbox's value.
 
     @abstractmethod
     async def setup(self, sandbox: Sandbox) -> None:
@@ -70,8 +68,21 @@ class AbstractTrial(ABC):
         """
 
     async def _upload_files(self, sandbox: Sandbox) -> None:
-        """Shared helper: upload all entries in ``config.file_uploads``."""
-        for local_path, sandbox_path in self._config.file_uploads:
-            obs = await sandbox.fs.upload_dir(source_dir=local_path, target_dir=sandbox_path)
-            if obs.exit_code != 0:
-                raise RuntimeError(f"Failed to upload {local_path} -> {sandbox_path}: {obs.failure_reason}")
+        """Shared helper: upload all entries in ``config.uploads``.
+
+        Automatically detects file vs directory and dispatches accordingly:
+        - file  → ``sandbox.upload_by_path()``
+        - dir   → ``sandbox.fs.upload_dir()``
+        """
+        for local_path, sandbox_path in self._config.environment.uploads:
+            src = Path(local_path)
+            if src.is_file():
+                resp = await sandbox.upload_by_path(file_path=local_path, target_path=sandbox_path)
+                if not resp.success:
+                    raise RuntimeError(f"Failed to upload file {local_path} -> {sandbox_path}: {resp.message}")
+            elif src.is_dir():
+                obs = await sandbox.fs.upload_dir(source_dir=local_path, target_dir=sandbox_path)
+                if obs.exit_code != 0:
+                    raise RuntimeError(f"Failed to upload dir {local_path} -> {sandbox_path}: {obs.failure_reason}")
+            else:
+                raise RuntimeError(f"Upload source not found or unsupported: {local_path}")

@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import rock.sdk.bench  # pre-import to avoid circular  # noqa: F401
 import rock.sdk.job.trial.bash  # register BashJobConfig -> BashTrial  # noqa: F401
 from rock.sdk.bench.constants import USER_DEFINED_LOGS
 from rock.sdk.job.config import BashJobConfig
@@ -154,24 +153,14 @@ class TestJobExecutorWait:
 
 
 # ---------------------------------------------------------------------------
-# auto_stop behavior
+# sandbox close behavior
 # ---------------------------------------------------------------------------
 
 
-class TestJobExecutorAutoStop:
-    async def test_auto_stop_true_closes_sandbox(self):
+class TestJobExecutorSandboxClose:
+    async def test_sandbox_not_closed_after_run(self):
         mock_sandbox = _make_mock_sandbox()
         with patch("rock.sdk.job.executor.Sandbox", return_value=mock_sandbox):
-            config = BashJobConfig(script="echo hi", job_name="test", auto_stop=True)
-            executor = JobExecutor()
-            await executor.run(ScatterOperator(size=1), config)
-
-        assert mock_sandbox.close.call_count == 1
-
-    async def test_auto_stop_false_does_not_close_sandbox(self):
-        mock_sandbox = _make_mock_sandbox()
-        with patch("rock.sdk.job.executor.Sandbox", return_value=mock_sandbox):
-            # default: auto_stop=False
             config = BashJobConfig(script="echo hi", job_name="test")
             executor = JobExecutor()
             await executor.run(ScatterOperator(size=1), config)
@@ -192,7 +181,9 @@ class TestBuildSessionEnv:
                 monkeypatch.delenv(k, raising=False)
         monkeypatch.setenv("OSS_KEY", "value")
 
-        config = BashJobConfig(script="echo hi", env={"X": "1"})
+        from rock.sdk.envhub import EnvironmentConfig
+
+        config = BashJobConfig(script="echo hi", environment=EnvironmentConfig(env={"X": "1"}))
         merged = JobExecutor._build_session_env(config)
 
         assert merged is not None
@@ -205,7 +196,9 @@ class TestBuildSessionEnv:
                 monkeypatch.delenv(k, raising=False)
         monkeypatch.setenv("OSS_KEY", "process_val")
 
-        config = BashJobConfig(script="echo hi", env={"OSS_KEY": "config_val"})
+        from rock.sdk.envhub import EnvironmentConfig
+
+        config = BashJobConfig(script="echo hi", environment=EnvironmentConfig(env={"OSS_KEY": "config_val"}))
         merged = JobExecutor._build_session_env(config)
 
         assert merged is not None

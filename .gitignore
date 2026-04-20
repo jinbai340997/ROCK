@@ -24,3 +24,6 @@ docs/superpowers/
 
 .env
 *.db
+*.intern.yaml
+*.intern.md
+.worktrees/

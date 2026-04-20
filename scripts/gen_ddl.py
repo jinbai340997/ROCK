@@ -15,9 +15,11 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 def get_dialect(name: str):
     if name == "postgresql":
         from sqlalchemy.dialects import postgresql
+
         return postgresql.dialect()
     if name == "sqlite":
         from sqlalchemy.dialects import sqlite
+
         return sqlite.dialect()
     print(f"Unsupported dialect: {name}", file=sys.stderr)
     sys.exit(1)
@@ -30,7 +32,8 @@ def gen_ddl(dialect) -> str:
     lines: list[str] = []
     for table in Base.metadata.sorted_tables:
         lines.append(str(CreateTable(table).compile(dialect=dialect)).strip() + ";")
-        for index in table.indexes:
+        # table.indexes has set-like semantics; sort for deterministic output.
+        for index in sorted(table.indexes, key=lambda idx: idx.name or ""):
             lines.append(str(CreateIndex(index).compile(dialect=dialect)).strip() + ";")
 
     return "\n\n".join(lines)

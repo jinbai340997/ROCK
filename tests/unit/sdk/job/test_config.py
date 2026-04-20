@@ -19,6 +19,7 @@ from rock.sdk.bench.models.trial.config import (
     TemplateConfig,
     VerifierConfig,
 )
+from rock.sdk.envhub import EnvironmentConfig
 from rock.sdk.job.config import BashJobConfig, JobConfig
 
 # ---------------------------------------------------------------------------
@@ -29,29 +30,27 @@ from rock.sdk.job.config import BashJobConfig, JobConfig
 class TestJobConfig:
     def test_defaults(self):
         cfg = JobConfig()
-        assert isinstance(cfg.environment, RockEnvironmentConfig)
+        assert isinstance(cfg.environment, EnvironmentConfig)
         assert cfg.job_name is None
         assert cfg.namespace is None
         assert cfg.experiment_id is None
         assert cfg.labels == {}
-        assert cfg.auto_stop is False
-        assert cfg.setup_commands == []
-        assert cfg.file_uploads == []
-        assert cfg.env == {}
-        assert cfg.timeout == 3600
+        assert cfg.timeout == 7200
+        assert cfg.environment.uploads == []
+        assert cfg.environment.env == {}
 
     def test_custom_values(self):
-        env = RockEnvironmentConfig(image="ubuntu:22.04")
+        env = EnvironmentConfig(
+            image="ubuntu:22.04",
+            uploads=[("/local/file.py", "/sandbox/file.py")],
+            env={"MY_VAR": "hello"},
+        )
         cfg = JobConfig(
             environment=env,
             job_name="my-job",
             namespace="team-a",
             experiment_id="exp-001",
             labels={"step": "42"},
-            auto_stop=True,
-            setup_commands=["pip install foo"],
-            file_uploads=[("/local/file.py", "/sandbox/file.py")],
-            env={"MY_VAR": "hello"},
             timeout=7200,
         )
         assert cfg.environment.image == "ubuntu:22.04"
@@ -59,10 +58,8 @@ class TestJobConfig:
         assert cfg.namespace == "team-a"
         assert cfg.experiment_id == "exp-001"
         assert cfg.labels == {"step": "42"}
-        assert cfg.auto_stop is True
-        assert cfg.setup_commands == ["pip install foo"]
-        assert cfg.file_uploads == [("/local/file.py", "/sandbox/file.py")]
-        assert cfg.env == {"MY_VAR": "hello"}
+        assert cfg.environment.uploads == [("/local/file.py", "/sandbox/file.py")]
+        assert cfg.environment.env == {"MY_VAR": "hello"}
         assert cfg.timeout == 7200
 
     def test_is_base_model(self):
@@ -70,6 +67,56 @@ class TestJobConfig:
         from pydantic import BaseModel
 
         assert issubclass(JobConfig, BaseModel)
+
+    def test_experiment_id_overrides_environment_experiment_id(self):
+        """When both experiment_ids differ, JobConfig.experiment_id wins and a warning is logged."""
+        from unittest.mock import patch
+
+        import rock.sdk.job.config as job_config_module
+
+        env = EnvironmentConfig(experiment_id="default")
+        with patch.object(job_config_module.logger, "warning") as mock_warn:
+            cfg = JobConfig(experiment_id="claw-eval", environment=env)
+
+        assert cfg.environment.experiment_id == "claw-eval"
+        mock_warn.assert_called_once()
+        warn_msg = mock_warn.call_args[0][0]
+        assert "experiment_id" in warn_msg
+        assert "claw-eval" in str(mock_warn.call_args)
+
+    def test_environment_experiment_id_preserved_when_job_unset(self):
+        """When only environment.experiment_id is set, it is preserved unchanged."""
+        env = EnvironmentConfig(experiment_id="from-env")
+        cfg = JobConfig(environment=env)
+
+        assert cfg.environment.experiment_id == "from-env"
+        assert cfg.experiment_id is None
+
+    def test_no_warning_when_experiment_ids_match(self):
+        """When both experiment_ids are the same, no warning is emitted."""
+        from unittest.mock import patch
+
+        import rock.sdk.job.config as job_config_module
+
+        env = EnvironmentConfig(experiment_id="same-exp")
+        with patch.object(job_config_module.logger, "warning") as mock_warn:
+            cfg = JobConfig(experiment_id="same-exp", environment=env)
+
+        assert cfg.environment.experiment_id == "same-exp"
+        mock_warn.assert_not_called()
+
+    def test_experiment_id_synced_to_environment_when_env_is_none(self):
+        """When JobConfig.experiment_id is set and environment.experiment_id is None,
+        it should be synced down to environment without a warning."""
+        from unittest.mock import patch
+
+        import rock.sdk.job.config as job_config_module
+
+        with patch.object(job_config_module.logger, "warning") as mock_warn:
+            cfg = JobConfig(experiment_id="exp-sync")
+
+        assert cfg.environment.experiment_id == "exp-sync"
+        mock_warn.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +131,7 @@ class TestBashJobConfig:
     def test_defaults(self):
         cfg = BashJobConfig()
         # Inherited defaults
-        assert cfg.timeout == 3600
+        assert cfg.timeout == 7200
         assert cfg.labels == {}
         # Own defaults
         assert cfg.script is None
@@ -178,43 +225,32 @@ class TestHarborJobConfig:
 
 
 class TestHarborJobConfigToHarborYaml:
-    def test_excludes_rock_fields(self):
-        """Rock-level fields (job_name, namespace, etc.) must NOT appear in Harbor YAML.
-
-        Note: 'environment' is excluded from _ROCK_FIELDS dump, but harbor
-        environment fields are re-injected via to_harbor_environment(), so
-        the 'environment' key *may* appear with harbor-native fields only.
-        """
+    def test_excludes_rock_fields_keeps_harbor_shared_fields(self):
+        """Rock-only fields must not appear, but Harbor-shared fields must be present."""
         cfg = HarborJobConfig(
-            job_name="should-not-appear",
-            namespace="should-not-appear",
-            experiment_id="should-not-appear",
+            job_name="test-job",
+            namespace="my-ns",
+            experiment_id="my-exp",
             labels={"step": "1"},
-            auto_stop=True,
-            setup_commands=["pip install foo"],
-            file_uploads=[("/a", "/b")],
-            env={"KEY": "VAL"},
+            environment=RockEnvironmentConfig(
+                uploads=[("/a", "/b")],
+                env={"KEY": "VAL"},
+            ),
             timeout=999,
             n_attempts=2,
             debug=True,
         )
         yaml_str = cfg.to_harbor_yaml()
         data = yaml.safe_load(yaml_str)
-        # Rock-only fields must be absent from Harbor YAML
-        # job_name is re-injected so harbor uses it as the directory name
-        assert data["job_name"] == "should-not-appear"
-        rock_only = {
-            "namespace",
-            "experiment_id",
-            "labels",
-            "auto_stop",
-            "setup_commands",
-            "file_uploads",
-            "env",
-            "timeout",
-        }
-        for rock_field in rock_only:
-            assert rock_field not in data, f"Rock field '{rock_field}' should be excluded from Harbor YAML"
+        # Shared with Harbor — must be present
+        assert data["job_name"] == "test-job"
+        assert data["namespace"] == "my-ns"
+        assert data["experiment_id"] == "my-exp"
+        assert data["labels"] == {"step": "1"}
+        # Rock-only — must be absent
+        rock_only = {"uploads", "timeout"}
+        for field in rock_only:
+            assert field not in data, f"Rock field '{field}' should be excluded"
 
     def test_includes_harbor_fields(self):
         cfg = HarborJobConfig(experiment_id="test-exp", n_attempts=5, debug=True)
@@ -401,9 +437,7 @@ class TestNativeConfig:
         assert "template" not in data
 
     def test_exclude_none_includes_template_when_set(self):
-        cfg = NativeConfig(
-            template=TemplateConfig(name="my-agent/my-org/my-dataset", revision="rev1")
-        )
+        cfg = NativeConfig(template=TemplateConfig(name="my-agent/my-org/my-dataset", revision="rev1"))
         data = cfg.model_dump(mode="json", exclude_none=True)
         assert "template" in data
         assert data["template"]["name"] == "my-agent/my-org/my-dataset"
@@ -415,40 +449,6 @@ class TestHarborInheritsBase:
         base_fields = set(JobConfig.model_fields.keys())
         harbor_fields = set(HarborJobConfig.model_fields.keys())
         assert base_fields.issubset(harbor_fields)
-
-
-# ---------------------------------------------------------------------------
-# G7: HarborJobConfig.auto_stop and environment.auto_stop sync (OR semantics)
-# ---------------------------------------------------------------------------
-
-
-class TestHarborJobConfigAutoStopSync:
-    """G7: HarborJobConfig.auto_stop and environment.auto_stop must be kept in sync (OR semantics)."""
-
-    def test_environment_auto_stop_propagates_to_top_level(self):
-        cfg = HarborJobConfig(
-            experiment_id="exp-1",
-            environment=RockEnvironmentConfig(auto_stop=True),
-        )
-        assert cfg.auto_stop is True, "top-level auto_stop must pick up environment.auto_stop"
-
-    def test_top_level_auto_stop_propagates_to_environment(self):
-        cfg = HarborJobConfig(experiment_id="exp-1", auto_stop=True)
-        assert cfg.environment.auto_stop is True
-
-    def test_both_true_stays_true(self):
-        cfg = HarborJobConfig(
-            experiment_id="exp-1",
-            auto_stop=True,
-            environment=RockEnvironmentConfig(auto_stop=True),
-        )
-        assert cfg.auto_stop is True
-        assert cfg.environment.auto_stop is True
-
-    def test_both_false_stays_false(self):
-        cfg = HarborJobConfig(experiment_id="exp-1")
-        assert cfg.auto_stop is False
-        assert cfg.environment.auto_stop is False
 
 
 # ---------------------------------------------------------------------------
@@ -551,3 +551,136 @@ class TestHarborJobConfigEffectiveTimeout:
         from rock.sdk.bench.constants import DEFAULT_WAIT_TIMEOUT
 
         assert cfg.timeout == int(DEFAULT_WAIT_TIMEOUT * 2.0)
+
+
+# ---------------------------------------------------------------------------
+# JobConfig.from_yaml — auto-detection
+# ---------------------------------------------------------------------------
+
+
+class TestJobConfigFromYamlAutoDetect:
+    """JobConfig.from_yaml dispatches to the correct subclass based on YAML content."""
+
+    def test_auto_detect_bash_by_script(self, tmp_path):
+        yaml_content = "script: echo hello\ntimeout: 60\n"
+        p = tmp_path / "cfg.yaml"
+        p.write_text(yaml_content)
+        cfg = JobConfig.from_yaml(str(p))
+        assert isinstance(cfg, BashJobConfig)
+        assert cfg.script == "echo hello"
+
+    def test_auto_detect_bash_by_script_path(self, tmp_path):
+        yaml_content = "script_path: run.sh\n"
+        p = tmp_path / "cfg.yaml"
+        p.write_text(yaml_content)
+        cfg = JobConfig.from_yaml(str(p))
+        assert isinstance(cfg, BashJobConfig)
+        assert cfg.script_path == "run.sh"
+
+    def test_auto_detect_harbor_by_agents(self, tmp_path):
+        yaml_content = "experiment_id: exp-1\nagents:\n  - name: my-agent\n"
+        p = tmp_path / "cfg.yaml"
+        p.write_text(yaml_content)
+        cfg = JobConfig.from_yaml(str(p))
+        assert isinstance(cfg, HarborJobConfig)
+        assert cfg.experiment_id == "exp-1"
+
+    def test_auto_detect_harbor_by_datasets(self, tmp_path):
+        yaml_content = "experiment_id: exp-2\n" "datasets:\n" "  - name: my-ds\n" "    path: /tmp/ds\n"
+        p = tmp_path / "cfg.yaml"
+        p.write_text(yaml_content)
+        cfg = JobConfig.from_yaml(str(p))
+        assert isinstance(cfg, HarborJobConfig)
+
+    def test_auto_detect_harbor_by_n_attempts(self, tmp_path):
+        yaml_content = "experiment_id: exp-3\nn_attempts: 5\n"
+        p = tmp_path / "cfg.yaml"
+        p.write_text(yaml_content)
+        cfg = JobConfig.from_yaml(str(p))
+        assert isinstance(cfg, HarborJobConfig)
+        assert cfg.n_attempts == 5
+
+    def test_auto_detect_harbor_by_debug_flag(self, tmp_path):
+        yaml_content = "experiment_id: exp-4\ndebug: true\n"
+        p = tmp_path / "cfg.yaml"
+        p.write_text(yaml_content)
+        cfg = JobConfig.from_yaml(str(p))
+        assert isinstance(cfg, HarborJobConfig)
+        assert cfg.debug is True
+
+    def test_raises_on_mixed_fields(self, tmp_path):
+        """YAML with fields from both job types fails validation against either model."""
+        yaml_content = "script: echo hi\nagents:\n  - name: a\nexperiment_id: exp\n"
+        p = tmp_path / "mixed.yaml"
+        p.write_text(yaml_content)
+        with pytest.raises(ValueError, match="does not match any known job type"):
+            JobConfig.from_yaml(str(p))
+
+    def test_base_only_yaml_falls_through_to_bash(self, tmp_path):
+        """YAML with only base fields (no harbor exclusive) falls through to BashJobConfig.
+
+        HarborJobConfig requires experiment_id, so it fails; BashJobConfig has all
+        optional fields and succeeds.
+        """
+        yaml_content = "job_name: my-job\ntimeout: 300\n"
+        p = tmp_path / "base_only.yaml"
+        p.write_text(yaml_content)
+        cfg = JobConfig.from_yaml(str(p))
+        assert isinstance(cfg, BashJobConfig)
+        assert cfg.job_name == "my-job"
+        assert cfg.timeout == 300
+
+    def test_bash_from_yaml_direct_still_works(self, tmp_path):
+        """BashJobConfig.from_yaml() continues to work regardless of auto-detect."""
+        yaml_content = "script: ls -la\ntimeout: 120\n"
+        p = tmp_path / "bash.yaml"
+        p.write_text(yaml_content)
+        cfg = BashJobConfig.from_yaml(str(p))
+        assert isinstance(cfg, BashJobConfig)
+        assert cfg.script == "ls -la"
+
+    def test_harbor_from_yaml_direct_still_works(self, tmp_path):
+        """HarborJobConfig.from_yaml() continues to work regardless of auto-detect."""
+        yaml_content = "experiment_id: exp-5\nn_attempts: 2\n"
+        p = tmp_path / "harbor.yaml"
+        p.write_text(yaml_content)
+        cfg = HarborJobConfig.from_yaml(str(p))
+        assert isinstance(cfg, HarborJobConfig)
+        assert cfg.n_attempts == 2
+
+
+# ---------------------------------------------------------------------------
+# OssMirrorConfig on base EnvironmentConfig
+# ---------------------------------------------------------------------------
+
+
+class TestOssMirrorConfigOnBaseEnvironment:
+    def test_base_env_default_oss_mirror_is_none(self):
+        assert EnvironmentConfig().oss_mirror is None
+
+    def test_base_env_accepts_oss_mirror(self):
+        from rock.sdk.envhub.config import OssMirrorConfig
+
+        cfg = EnvironmentConfig(oss_mirror=OssMirrorConfig(enabled=True, oss_bucket="b"))
+        assert cfg.oss_mirror.enabled is True
+
+    def test_oss_mirror_config_importable_from_envhub(self):
+        from rock.sdk.envhub.config import OssMirrorConfig
+
+        assert OssMirrorConfig().enabled is False
+
+
+# ---------------------------------------------------------------------------
+# BashJobConfig.job_name UUID default
+# ---------------------------------------------------------------------------
+
+
+class TestBashJobConfigJobNameDefault:
+    def test_defaults_to_datetime_string(self):
+        cfg = BashJobConfig(script="echo hi")
+        import re
+
+        assert re.match(r"\d{4}-\d{2}-\d{2}__\d{2}-\d{2}-\d{2}", cfg.job_name)
+
+    def test_explicit_name_preserved(self):
+        assert BashJobConfig(job_name="x").job_name == "x"

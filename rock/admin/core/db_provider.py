@@ -32,8 +32,13 @@ class DatabaseProvider:
         return self._engine
 
     async def init(self) -> None:
-        """Create the async engine."""
-        self._engine = create_async_engine(self._url, echo=False)
+        """Create the async engine.
+
+        For asyncpg, ``statement_cache_size=0`` prevents
+        ``InvalidCachedStatementError`` after external DDL changes
+        """
+        connect_args = {"statement_cache_size": 0} if "asyncpg" in self._url else {}
+        self._engine = create_async_engine(self._url, echo=False, connect_args=connect_args)
 
     async def create_tables(self) -> None:
         """Create all tables defined in Base.metadata (idempotent)."""
@@ -52,5 +57,5 @@ class DatabaseProvider:
             return url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
         if url.startswith("postgresql://") or url.startswith("postgres://"):
             prefix = "postgresql://" if url.startswith("postgresql://") else "postgres://"
-            return "postgresql+asyncpg://" + url[len(prefix):]
+            return "postgresql+asyncpg://" + url[len(prefix) :]
         return url
