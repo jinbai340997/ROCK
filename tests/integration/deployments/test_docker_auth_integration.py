@@ -178,8 +178,14 @@ class TestIntegrationWithLocalRegistry:
 
     @pytest.mark.asyncio
     @pytest.mark.need_docker
+    @pytest.mark.skip(reason="Requires Docker daemon insecure-registry config for localhost")
     async def test_pull_from_private_registry_with_temp_auth(self, local_registry):
-        """Test pulling from private registry with temp auth."""
+        """Test pulling from private registry with temp auth.
+
+        NOTE: This test requires Docker daemon to be configured with
+        insecure-registries for localhost/127.0.0.1. See:
+        https://docs.docker.com/engine/reference/commandline/dockerd/#insecure-registries
+        """
         registry_url, username, password = local_registry
 
         # This test verifies the auth flow works with a real registry

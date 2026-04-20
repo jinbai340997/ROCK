@@ -12,9 +12,7 @@ import logging
 import shutil
 import subprocess
 import tempfile
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
 
 from rock import env_vars
 
@@ -236,39 +234,4 @@ class TempAuthDockerClient:
         return self._logged_in
 
 
-@contextmanager
-def temp_docker_auth_context(
-    registry: str | None = None,
-    username: str | None = None,
-    password: str | None = None,
-    base_dir: str | None = None
-) -> Generator[TempAuthDockerClient, None, None]:
-    """Context manager factory for TempAuthDockerClient.
 
-    This is provided for backward compatibility and convenience.
-
-    Usage:
-        with temp_docker_auth_context("registry.com", "user", "pass") as client:
-            client.pull("registry.com/app:v1")
-
-    Args:
-        registry: Registry address (optional)
-        username: Username (optional)
-        password: Password (optional)
-        base_dir: Parent directory of the temporary directory (optional)
-
-    Yields:
-        TempAuthDockerClient instance
-    """
-    with TempAuthDockerClient(
-        registry=registry,
-        username=username,
-        password=password,
-        base_dir=base_dir
-    ) as client:
-        yield client
-
-
-# Backward compatibility alias
-TempDockerAuth = TempAuthDockerClient
-TempDockerAuthError = TempAuthDockerClientError

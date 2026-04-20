@@ -3,7 +3,6 @@ Unit tests for rock/utils/docker_auth.py
 
 Tests cover:
 - TempAuthDockerClient class: context manager, login, pull, is_image_available
-- temp_docker_auth_context factory function
 - TempAuthDockerClientError exception
 """
 
@@ -17,9 +16,6 @@ import pytest
 from rock.utils.docker_auth import (
     TempAuthDockerClient,
     TempAuthDockerClientError,
-    temp_docker_auth_context,
-    TempDockerAuth,  # Backward compatibility alias
-    TempDockerAuthError,  # Backward compatibility alias
 )
 
 
@@ -326,49 +322,6 @@ class TestTempAuthDockerClientIsImageAvailable:
         assert result is False
 
 
-class TestTempDockerAuthContext:
-    """Tests for temp_docker_auth_context factory function."""
-
-    def test_context_creates_and_cleans_up(self):
-        """Test context manager creates and cleans up temp dir."""
-        with temp_docker_auth_context() as client:
-            assert client.temp_dir is not None
-            assert client.temp_dir.exists()
-            path = client.temp_dir
-
-        assert not path.exists()
-
-    def test_context_with_credentials(self):
-        """Test context manager with credentials calls login."""
-        with patch.object(TempAuthDockerClient, '_login') as mock_login:
-            with temp_docker_auth_context(
-                registry="registry.example.com",
-                username="user",
-                password="pass"
-            ) as client:
-                assert client.temp_dir is not None
-
-            mock_login.assert_called_once()
-
-    def test_context_cleanup_on_exception(self):
-        """Test context manager cleans up on exception."""
-        with pytest.raises(ValueError):
-            with temp_docker_auth_context() as client:
-                path = client.temp_dir
-                raise ValueError("Test error")
-
-        assert not path.exists()
-
-    def test_context_with_base_dir(self):
-        """Test context manager with custom base_dir."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with temp_docker_auth_context(base_dir=tmpdir) as client:
-                assert str(client.temp_dir).startswith(tmpdir)
-                path = client.temp_dir
-
-            assert not path.exists()
-
-
 class TestTempAuthDockerClientError:
     """Tests for TempAuthDockerClientError exception."""
 
@@ -385,27 +338,6 @@ class TestTempAuthDockerClientError:
         """Test TempAuthDockerClientError can be raised and caught."""
         with pytest.raises(TempAuthDockerClientError):
             raise TempAuthDockerClientError("Test error")
-
-
-class TestBackwardCompatibilityAliases:
-    """Tests for backward compatibility aliases."""
-
-    def test_temp_docker_auth_is_alias(self):
-        """Test TempDockerAuth is an alias for TempAuthDockerClient."""
-        assert TempDockerAuth is TempAuthDockerClient
-
-    def test_temp_docker_auth_error_is_alias(self):
-        """Test TempDockerAuthError is an alias for TempAuthDockerClientError."""
-        assert TempDockerAuthError is TempAuthDockerClientError
-
-    def test_backward_compatible_usage(self):
-        """Test backward compatible usage of TempDockerAuth."""
-        with TempDockerAuth() as auth:
-            assert auth.temp_dir is not None
-            assert auth.temp_dir.exists()
-            path = auth.temp_dir
-
-        assert not path.exists()
 
 
 class TestIntegration:

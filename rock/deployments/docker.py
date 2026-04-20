@@ -268,7 +268,6 @@ class DockerDeployment(AbstractDeployment):
                     username=self._config.registry_username,
                     password=self._config.registry_password,
                 ) as client:
-                    self._hooks.on_custom_step(DeploymentHookStep.PULLING_IMAGE)
                     client.pull(self._config.image)
 
             self._service_status.update_status(
