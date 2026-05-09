@@ -15,4 +15,7 @@ jobs:
       - name: Sync fork with upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh repo sync ${{ github.repository }} --branch master
+        run: |
+          gh api repos/${{ github.repository }}/merge-upstream \
+            --method POST \
+            --field branch=master
