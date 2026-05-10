@@ -31,3 +31,8 @@ class MetricsConstants:
     METASTORE_DB_SUCCESS = "meta_store.db.success"
     METASTORE_DB_FAILURE = "meta_store.db.failure"
     METASTORE_DB_RT = "meta_store.db.rt"
+
+    SANDBOX_LOG_ARCHIVE_TOTAL = "sandbox.log.archive.total"
+    SANDBOX_LOG_ARCHIVE_SUCCESS = "sandbox.log.archive.success"
+    SANDBOX_LOG_ARCHIVE_FAILURE = "sandbox.log.archive.failure"
+    SANDBOX_LOG_ARCHIVE_SIZE = "sandbox.log.archive.size_bytes"

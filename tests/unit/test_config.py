@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from rock.config import RockConfig, RuntimeConfig
+from rock.config import OssConfig, RockConfig, RuntimeConfig, SandboxConfig
+from rock.deployments.log_cleanup import LogCleanupPolicy
 
 
 @pytest.mark.asyncio
@@ -334,3 +335,48 @@ class TestFromEnvBaseInheritance:
         """))
         with pytest.raises(Exception, match="base config file.*not found"):
             RockConfig.from_env(config_path=str(child_file))
+
+
+class TestSandboxConfig_1:
+    def test_default_policy_is_archive_then_clean(self):
+        sc = SandboxConfig()
+        assert sc.sandbox_log_cleanup_policy_default == LogCleanupPolicy.ARCHIVE_THEN_CLEAN
+
+    def test_string_value_converted_to_enum(self):
+        # yaml deserialization passes strings; __post_init__ converts.
+        sc = SandboxConfig(sandbox_log_cleanup_policy_default="keep")
+        assert sc.sandbox_log_cleanup_policy_default == LogCleanupPolicy.KEEP
+
+    def test_enum_value_passes_through(self):
+        sc = SandboxConfig(sandbox_log_cleanup_policy_default=LogCleanupPolicy.CLEAN_DIRECTLY)
+        assert sc.sandbox_log_cleanup_policy_default == LogCleanupPolicy.CLEAN_DIRECTLY
+
+    def test_existing_fields_unchanged(self):
+        # Regression: PR-1 must not break existing defaults
+        sc = SandboxConfig()
+        assert sc.actor_resource == ""
+        assert sc.actor_resource_num == 0.0
+        assert sc.gateway_num == 1
+        assert sc.remove_container_enabled is True
+
+
+class TestOssConfig_1:
+    def test_default_archive_prefix(self):
+        oss = OssConfig()
+        assert oss.archive_prefix == "rock-archives/"
+
+    def test_default_archive_ttl_days(self):
+        oss = OssConfig()
+        assert oss.archive_ttl_days == 30
+
+    def test_existing_fields_unchanged(self):
+        oss = OssConfig()
+        assert oss.endpoint == ""
+        assert oss.bucket == ""
+        assert oss.access_key_id == ""
+        assert oss.access_key_secret == ""
+        assert oss.role_arn == ""
+
+    def test_custom_archive_prefix(self):
+        oss = OssConfig(archive_prefix="my-rock/")
+        assert oss.archive_prefix == "my-rock/"

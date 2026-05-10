@@ -1,6 +1,7 @@
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import yaml
 
@@ -8,6 +9,9 @@ from rock import env_vars
 from rock.logger import init_logger
 from rock.utils.database import is_absolute_db_path
 from rock.utils.providers import NacosConfigProvider
+
+if TYPE_CHECKING:
+    from rock.deployments.log_cleanup import LogCleanupPolicy
 
 logger = init_logger(__name__)
 
@@ -50,12 +54,31 @@ class RedisConfig:
     password: str = ""
 
 
+def _default_log_cleanup_policy() -> "LogCleanupPolicy":
+    # Lazy import to avoid the cycle:
+    # rock.config -> rock.deployments.log_cleanup -> rock.deployments.__init__
+    # -> rock.deployments.config -> rock.config
+    from rock.deployments.log_cleanup import LogCleanupPolicy
+
+    return LogCleanupPolicy.ARCHIVE_THEN_CLEAN
+
+
 @dataclass
 class SandboxConfig:
     actor_resource: str = ""
     actor_resource_num: float = 0.0
     gateway_num: int = 1
     remove_container_enabled: bool = True
+    sandbox_log_cleanup_policy_default: "LogCleanupPolicy" = field(default_factory=_default_log_cleanup_policy)
+    """Cluster-wide default for DockerDeploymentConfig.sandbox_log_cleanup_policy.
+    Default ARCHIVE_THEN_CLEAN is fail-safe: when OssConfig is empty,
+    the upload returns False and _stop() preserves the dir."""
+
+    def __post_init__(self):
+        from rock.deployments.log_cleanup import LogCleanupPolicy
+
+        if isinstance(self.sandbox_log_cleanup_policy_default, str):
+            self.sandbox_log_cleanup_policy_default = LogCleanupPolicy(self.sandbox_log_cleanup_policy_default)
 
 
 @dataclass
@@ -65,6 +88,17 @@ class OssConfig:
     access_key_id: str = ""
     access_key_secret: str = ""
     role_arn: str = ""
+
+    archive_prefix: str = "rock-archives/"
+    """OSS object key prefix for ALL archives produced by ROCK
+    (sandbox logs, build results, etc.). Keeps archives in a single
+    sub-tree of the shared bucket so OSS lifecycle rules can target
+    them precisely without affecting other tenants of the bucket."""
+
+    archive_ttl_days: int = 30
+    """TTL passed via x-oss-meta-ttl-days header. Bucket-side
+    lifecycle rule should match this header to actually expire
+    objects."""
 
 
 @dataclass
@@ -273,7 +307,7 @@ class RockConfig:
     # 4. Newly added regional tasks: Appended to the list.
     # 5. To "disable" a specific base task within a region: Set `enabled: false`.
     # ============================================================================
-    
+
     @staticmethod
     def _deep_merge(base: dict, override: dict) -> dict:
         """Deep merge override into base. Override values take precedence."""
@@ -296,8 +330,9 @@ class RockConfig:
         # Check if both lists contain dicts with a common identity key
         merge_key = None
         for candidate in ("task_class", "name", "id"):
-            if (all(isinstance(item, dict) and candidate in item for item in base_list) and
-                    all(isinstance(item, dict) and candidate in item for item in override_list)):
+            if all(isinstance(item, dict) and candidate in item for item in base_list) and all(
+                isinstance(item, dict) and candidate in item for item in override_list
+            ):
                 merge_key = candidate
                 break
 

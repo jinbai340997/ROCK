@@ -4,6 +4,7 @@ import hashlib
 import os
 import random
 import shlex
+import shutil
 import subprocess
 import time
 import uuid
@@ -15,12 +16,14 @@ from typing_extensions import Self
 
 from rock import env_vars
 from rock.actions import IsAliveResponse, RemoteSandboxRuntimeConfig
+from rock.admin.metrics.monitor import MetricsMonitor
 from rock.common.constants import DeploymentHookStep
 from rock.deployments.abstract import AbstractDeployment
 from rock.deployments.config import DockerDeploymentConfig
 from rock.deployments.constants import Port, Status
 from rock.deployments.docker_client import TempAuthDockerClient, TempAuthDockerClientError
 from rock.deployments.hooks.abstract import CombinedDeploymentHook, DeploymentHook
+from rock.deployments.log_cleanup import LogCleanupPolicy
 from rock.deployments.runtime_env import DockerRuntimeEnv, LocalRuntimeEnv, PipRuntimeEnv, UvRuntimeEnv
 from rock.deployments.sandbox_validator import DockerSandboxValidator
 from rock.deployments.status import PersistedServiceStatus, ServiceStatus
@@ -40,6 +43,7 @@ from rock.utils import (
     timeout,
     wait_until_alive,
 )
+from rock.utils.oss_archiver import OssArchiver
 
 __all__ = ["DockerDeployment", "DockerDeploymentConfig"]
 CHECK_CLEAR_INTERVAL_SECONDS = 300
@@ -87,6 +91,17 @@ class DockerDeployment(AbstractDeployment):
             raise Exception(f"Invalid ROCK_WORKER_ENV_TYPE: {env_vars.ROCK_WORKER_ENV_TYPE}")
 
         self.sandbox_validator: DockerSandboxValidator | None = DockerSandboxValidator()
+
+        """ NEW (PR-1): per-deployment MetricsMonitor for disk governance
+        archive metrics. Sticks to ROCK convention (instance attribute);
+        decorator.py uses getattr(self, "metrics_monitor", None) so any
+        decorated method on this class also gains metrics for free.
+        MetricsMonitor.create() short-circuits to a no-op in dev/local/test
+        envs (see MetricsMonitor._should_skip), so unit tests don't pay
+        any OTLP exporter cost. """
+        self.metrics_monitor = MetricsMonitor.create(
+            metric_prefix="disk_governance",
+        )
 
     def add_hook(self, hook: DeploymentHook):
         self._hooks.add_hook(hook)
@@ -638,7 +653,80 @@ class DockerDeployment(AbstractDeployment):
         for _, port in service_status.get_port_mapping().items():
             release_port(port)
 
+        """clean per-sandbox host log directory
+
+        Note: This logic only cleans up ${ROCK_LOGGING_PATH}/<container_name>/.
+        It does not affect host-level logs (/data/logs/*.log, managed by logrotate)."""
+        if self._config and env_vars.ROCK_LOGGING_PATH and self._container_name:
+            log_dir = Path(env_vars.ROCK_LOGGING_PATH) / self._container_name
+            policy = self._config.sandbox_log_cleanup_policy
+            assert policy is not None, (
+                "sandbox_log_cleanup_policy must be resolved by DeploymentManager.init_config (None → cluster default)"
+            )
+
+            if log_dir.is_dir():
+                self._handle_sandbox_log_dir(log_dir, policy)
+
         self._config = None
+
+    def _handle_sandbox_log_dir(self, log_dir: Path, policy: LogCleanupPolicy) -> None:
+        """Apply LogCleanupPolicy to a sandbox bind-mount log dir.
+
+        Called ONLY by _stop(); never touches host-side /data/logs/*.log.
+        """
+        match policy:
+            case LogCleanupPolicy.KEEP:
+                logger.info(
+                    f"Keep sandbox log dir (policy=keep): {log_dir}; "
+                    f"FileCleanupTask will eventually purge file contents"
+                )
+                return
+            case LogCleanupPolicy.CLEAN_DIRECTLY:
+                shutil.rmtree(log_dir, ignore_errors=True)
+                logger.info(f"Cleaned sandbox log dir directly: {log_dir}")
+                return
+            case LogCleanupPolicy.ARCHIVE_THEN_CLEAN:
+                self._archive_then_clean(log_dir)
+                return
+            case _:
+                # Defensive: unknown policy → fall back to KEEP (safest).
+                # Prevents silent miscategorization if future enum values
+                # are added without updating this match block.
+                logger.error(f"Unknown sandbox_log_cleanup_policy {policy!r} for {log_dir}; falling back to KEEP")
+                return
+
+    def _archive_then_clean(self, log_dir: Path) -> None:
+        """ARCHIVE_THEN_CLEAN policy: upload to OSS, delete on success.
+
+        Passes self.metrics_monitor to OssArchiver explicitly (no
+        global state) so archive metrics carry the standard ROCK
+        attributes (host/pod/env/role/etc.) attached at monitor
+        construction time.
+        """
+        oss_key = OssArchiver.build_sandbox_log_key(self._container_name)
+        archived = OssArchiver.try_upload_dir_sync(
+            str(log_dir),
+            oss_key,
+            container_name=self._container_name,
+            metrics_monitor=getattr(self, "metrics_monitor", None),
+        )
+        if archived:
+            shutil.rmtree(log_dir, ignore_errors=True)
+            logger.info(f"Archived + cleaned sandbox log dir: {log_dir} -> oss://.../{oss_key}")
+        else:
+            # Fail-safe path. OssArchiver returns False on:
+            # - missing OssConfig
+            # - network/permission error
+            # - dir > max_size_bytes (default 5GB)
+            # - 60s upload timeout
+            # We preserve the dir; FileCleanupTask is the eventual fallback.
+            # Failure is tracked via metric (recorded inside OssArchiver
+            # using the metrics_monitor we just passed in).
+            logger.warning(
+                f"Archive failed; preserving sandbox log dir: {log_dir}. "
+                f"Inspect OssConfig / network; or set "
+                f"sandbox_log_cleanup_policy=clean_directly to accept loss"
+            )
 
     @property
     def runtime(self) -> RemoteSandboxRuntime:

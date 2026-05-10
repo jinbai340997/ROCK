@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from rock import env_vars
+from rock.config import OssConfig, RockConfig, SandboxConfig
+from rock.deployments.config import DockerDeploymentConfig
 from rock.utils.docker import DockerUtil
 
 # Set test data directories at import time (before test collection triggers
@@ -66,3 +68,44 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if "need_docker" in item.keywords:
                 item.add_marker(skip_docker)
+
+
+def make_rock_config(
+    *,
+    sandbox_config: SandboxConfig | None = None,
+    oss: OssConfig | None = None,
+) -> RockConfig:
+    """Build a minimal in-memory RockConfig for unit tests.
+
+    Use this instead of loading real yaml whenever the test only
+    needs to verify config-dependent behavior.
+    """
+    cfg = RockConfig()
+    if sandbox_config is not None:
+        cfg.sandbox_config = sandbox_config
+    if oss is not None:
+        cfg.oss = oss
+    return cfg
+
+
+def make_docker_deployment_config(
+    **overrides,
+) -> DockerDeploymentConfig:
+    """Build a DockerDeploymentConfig with sensible test defaults."""
+    defaults = {
+        "image": "python:3.11",
+        "container_name": "test-container",
+    }
+    defaults.update(overrides)
+    return DockerDeploymentConfig(**defaults)
+
+
+@pytest.fixture
+def make_rock_config_fixture():
+    """Fixture form for tests that prefer fixture-style injection."""
+    return make_rock_config
+
+
+@pytest.fixture
+def make_docker_deployment_config_fixture():
+    return make_docker_deployment_config
