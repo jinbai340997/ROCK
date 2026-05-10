@@ -50,6 +50,9 @@ class SandboxConfig(BaseConfig):
     """Override cluster default for sandbox log dir cleanup on stop.
     None = follow cluster (sandbox_config.sandbox_log_cleanup_policy_default).
     """
+    remove_images: bool | None = None
+    """Override cluster default for image removal on stop.
+    None = follow cluster default (sandbox_config.remove_images_default)."""
 
     @field_validator("auto_delete_seconds")
     @classmethod

@@ -53,3 +53,23 @@ class TestSandboxConfigPolicyField:
             "clean_directly",
             LogCleanupPolicy.CLEAN_DIRECTLY,
         )
+
+
+class TestSandboxConfigRemoveImagesField:
+    def test_default_is_none(self):
+        from rock.sdk.sandbox.config import SandboxConfig
+        cfg = SandboxConfig()
+        assert cfg.remove_images is None
+
+    def test_explicit_true(self):
+        from rock.sdk.sandbox.config import SandboxConfig
+        cfg = SandboxConfig(remove_images=True)
+        assert cfg.remove_images is True
+
+    def test_explicit_false_serializes(self):
+        """Critical: must NOT be exclude_none-d out of model_dump,
+        otherwise the explicit False loses its override semantics."""
+        from rock.sdk.sandbox.config import SandboxConfig
+        cfg = SandboxConfig(remove_images=False)
+        payload = cfg.model_dump()
+        assert payload["remove_images"] is False

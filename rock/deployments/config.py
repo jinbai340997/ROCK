@@ -70,8 +70,13 @@ class DockerDeploymentConfig(DeploymentConfig):
     pull: Literal["never", "always", "missing"] = "missing"
     """Docker image pull policy: 'never', 'always', or 'missing'."""
 
-    remove_images: bool = False
-    """Whether to remove the Docker image after the container stops."""
+    remove_images: bool | None = None
+    """Whether to remove the Docker image after the container stops.
+    Three-layer override (PR-2):
+        None        = follow cluster default
+                      (sandbox_config.remove_images_default)
+        True/False  = explicit per-sandbox override
+    """
 
     python_standalone_dir: str | None = None
     """Directory path for Python standalone installation within the container."""

@@ -48,6 +48,8 @@ class DeploymentManager:
         sandbox_cfg = self.rock_config.sandbox_config
         if docker_deployment_config.sandbox_log_cleanup_policy is None:
             docker_deployment_config.sandbox_log_cleanup_policy = sandbox_cfg.sandbox_log_cleanup_policy_default
+        if docker_deployment_config.remove_images is None:
+            docker_deployment_config.remove_images = sandbox_cfg.remove_images_default
 
         return docker_deployment_config
 

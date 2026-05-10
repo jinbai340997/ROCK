@@ -66,6 +66,18 @@ if TYPE_CHECKING:
 
     ROCK_MODEL_SERVICE_INSTALL_CMD: str
 
+    # safe_remove_image whitelist (comma-separated regex list).
+    # Empty/unset → built-in default.
+    ROCK_IMAGE_KEEP_PATTERNS: list[str] = []
+
+
+def _list_env(name: str, default: list[str]) -> list[str]:
+    """Parse a comma-separated env var into list[str]. Empty/unset → default."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
 
 environment_variables: dict[str, Callable[[], Any]] = {
     "ROCK_LOGGING_PATH": lambda: os.getenv("ROCK_LOGGING_PATH"),
@@ -134,6 +146,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Docker temp auth directory
     "ROCK_DOCKER_TEMP_AUTH_DIR": lambda: os.getenv("ROCK_DOCKER_TEMP_AUTH_DIR"),
+    # safe_remove_image whitelist (comma-separated regex list).
+    # Override via env, e.g.:
+    #   ROCK_IMAGE_KEEP_PATTERNS="^my-base.*$,^.*-protected$"
+    # Empty/unset → built-in default. To truly disable the whitelist
+    # set explicit "[]" handling at the call site (safe_remove_image).
+    "ROCK_IMAGE_KEEP_PATTERNS": lambda: _list_env(
+        "ROCK_IMAGE_KEEP_PATTERNS",
+        default=["^.*envhub.*$", "^rock-base.*$"],
+    ),
 }
 
 

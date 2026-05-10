@@ -31,6 +31,7 @@ from rock.logger import init_logger
 from rock.rocklet import PACKAGE_NAME, REMOTE_EXECUTABLE_NAME
 from rock.rocklet.exceptions import DeploymentNotStartedError, DockerPullError
 from rock.sandbox.remote_sandbox import RemoteSandboxRuntime
+from rock.utils.docker_safety import safe_remove_image
 from rock.utils import (
     ENV_POOL,
     DockerUtil,
@@ -638,11 +639,16 @@ class DockerDeployment(AbstractDeployment):
             self._container_name = None
 
         if self._config and self._config.remove_images and DockerUtil.is_image_available(self._config.image):
-            logger.info(f"Removing image {self._config.image}")
+            logger.info(f"Attempting to remove image {self._config.image}")
+            # Route through safe_remove_image — checks containers, EnvHub registration, and ROCK_IMAGE_KEEP_PATTERNS whitelist.
             try:
-                DockerUtil.remove_image(self._config.image)
-            except subprocess.CalledProcessError:
-                logger.error(f"Failed to remove image {self._config.image}", exc_info=True)
+                import asyncio
+                asyncio.run(safe_remove_image(self._config.image))
+            except Exception:
+                logger.error(
+                    f"Failed to remove image {self._config.image}",
+                    exc_info=True,
+                )
 
         if self._check_stop_task is not None:
             logger.info("Stopping check task")

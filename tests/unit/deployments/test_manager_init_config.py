@@ -78,3 +78,67 @@ async def test_existing_remove_container_logic_intact(
     user_cfg2 = make_docker_deployment_config_fixture(auto_delete_seconds=60)
     resolved2 = await mgr.init_config(user_cfg2)
     assert resolved2.remove_container is False
+
+@pytest.mark.asyncio
+async def test_remove_images_none_falls_back_to_cluster_default_false(
+    make_rock_config_fixture, make_docker_deployment_config_fixture,
+):
+    rock_config = make_rock_config_fixture(
+        sandbox_config=SandboxConfig(remove_images_default=False),
+    )
+    rock_config.update = AsyncMock(return_value=None)
+    mgr = DeploymentManager(rock_config)
+
+    user_cfg = make_docker_deployment_config_fixture()
+    assert user_cfg.remove_images is None
+    resolved = await mgr.init_config(user_cfg)
+    assert resolved.remove_images is False
+
+
+@pytest.mark.asyncio
+async def test_remove_images_none_falls_back_to_cluster_default_true(
+    make_rock_config_fixture, make_docker_deployment_config_fixture,
+):
+    rock_config = make_rock_config_fixture(
+        sandbox_config=SandboxConfig(remove_images_default=True),
+    )
+    rock_config.update = AsyncMock(return_value=None)
+    mgr = DeploymentManager(rock_config)
+
+    user_cfg = make_docker_deployment_config_fixture()
+    resolved = await mgr.init_config(user_cfg)
+    assert resolved.remove_images is True
+
+
+@pytest.mark.asyncio
+async def test_remove_images_user_explicit_true_beats_default_false(
+    make_rock_config_fixture, make_docker_deployment_config_fixture,
+):
+    rock_config = make_rock_config_fixture(
+        sandbox_config=SandboxConfig(remove_images_default=False),
+    )
+    rock_config.update = AsyncMock(return_value=None)
+    mgr = DeploymentManager(rock_config)
+
+    user_cfg = make_docker_deployment_config_fixture(remove_images=True)
+    resolved = await mgr.init_config(user_cfg)
+    assert resolved.remove_images is True
+
+@pytest.mark.asyncio
+async def test_remove_images_user_explicit_false_beats_default_true(
+    make_rock_config_fixture, make_docker_deployment_config_fixture,
+):
+    """Critical: user explicitly disabling must override cluster default."""
+    rock_config = make_rock_config_fixture(
+        sandbox_config=SandboxConfig(remove_images_default=True),
+    )
+    rock_config.update = AsyncMock(return_value=None)
+    mgr = DeploymentManager(rock_config)
+
+    user_cfg = make_docker_deployment_config_fixture(remove_images=False)
+    resolved = await mgr.init_config(user_cfg)
+    assert resolved.remove_images is False
+
+
+
+

@@ -73,6 +73,9 @@ class SandboxConfig:
     """Cluster-wide default for DockerDeploymentConfig.sandbox_log_cleanup_policy.
     Default ARCHIVE_THEN_CLEAN is fail-safe: when OssConfig is empty,
     the upload returns False and _stop() preserves the dir."""
+    remove_images_default: bool = False
+    """Cluster default for whether to remove sandbox images after the container stops. 
+    None on the per-sandbox config falls back to this. Existing default False preserves current behavior."""
 
     def __post_init__(self):
         from rock.deployments.log_cleanup import LogCleanupPolicy
@@ -307,7 +310,6 @@ class RockConfig:
     # 4. Newly added regional tasks: Appended to the list.
     # 5. To "disable" a specific base task within a region: Set `enabled: false`.
     # ============================================================================
-
     @staticmethod
     def _deep_merge(base: dict, override: dict) -> dict:
         """Deep merge override into base. Override values take precedence."""

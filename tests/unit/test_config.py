@@ -380,3 +380,14 @@ class TestOssConfig_1:
     def test_custom_archive_prefix(self):
         oss = OssConfig(archive_prefix="my-rock/")
         assert oss.archive_prefix == "my-rock/"
+
+class TestSandboxConfigRemoveImages:
+    def test_default_is_false(self):
+        from rock.config import SandboxConfig
+        sc = SandboxConfig()
+        assert sc.remove_images_default is False
+
+    def test_can_be_overridden(self):
+        from rock.config import SandboxConfig
+        sc = SandboxConfig(remove_images_default=True)
+        assert sc.remove_images_default is True

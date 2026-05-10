@@ -42,6 +42,9 @@ class SandboxStartRequest(BaseModel):
     """The time for automatic container deletion, with the unit being seconds."""
     sandbox_log_cleanup_policy: LogCleanupPolicy | None = None
     """The log cleanup policy for the sandbox."""
+    remove_images: bool | None = None
+    """Override cluster default for image removal on stop.
+    None = follow cluster (sandbox_config.remove_images_default)."""
 
 
 class SandboxCommand(Command):
