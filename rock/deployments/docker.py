@@ -40,11 +40,12 @@ from rock.utils import (
     timeout,
     wait_until_alive,
 )
+from rock.utils.docker_safety import safe_remove_image
 
 __all__ = ["DockerDeployment", "DockerDeploymentConfig"]
 CHECK_CLEAR_INTERVAL_SECONDS = 300
-XFS_PRJID_MIN = (1 << 31)                      # low project IDs are reserved for Docker
-XFS_PRJID_RANGE = (1 << 32) - XFS_PRJID_MIN   # use remaining 32-bit space: [XFS_PRJID_MIN, 2^32)
+XFS_PRJID_MIN = 1 << 31  # low project IDs are reserved for Docker
+XFS_PRJID_RANGE = (1 << 32) - XFS_PRJID_MIN  # use remaining 32-bit space: [XFS_PRJID_MIN, 2^32)
 
 
 logger = init_logger(__name__)
@@ -424,7 +425,9 @@ class DockerDeployment(AbstractDeployment):
             return
 
         # Derive a deterministic project id from container name; reserve low ids.
-        project_id = (int(hashlib.sha1(self.container_name.encode("utf-8")).hexdigest()[:8], 16) % XFS_PRJID_RANGE) + XFS_PRJID_MIN
+        project_id = (
+            int(hashlib.sha1(self.container_name.encode("utf-8")).hexdigest()[:8], 16) % XFS_PRJID_RANGE
+        ) + XFS_PRJID_MIN
         try:
             findmnt_result = subprocess.run(
                 ["findmnt", "-T", log_file_path, "-o", "TARGET", "--noheadings"],
@@ -665,11 +668,11 @@ class DockerDeployment(AbstractDeployment):
             self._container_name = None
 
         if self._config and self._config.remove_images and DockerUtil.is_image_available(self._config.image):
-            logger.info(f"Removing image {self._config.image}")
-            try:
-                DockerUtil.remove_image(self._config.image)
-            except subprocess.CalledProcessError:
-                logger.error(f"Failed to remove image {self._config.image}", exc_info=True)
+            # Route through safe_remove_image — protects images matching
+            # ROCK_IMAGE_KEEP_PATTERNS (default: envhub-derived + rock-base*).
+            # safe_remove_image swallows CalledProcessError internally and
+            # returns False; no exception propagates here.
+            safe_remove_image(self._config.image)
 
         if self._check_stop_task is not None:
             logger.info("Stopping check task")

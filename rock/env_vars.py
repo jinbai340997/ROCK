@@ -67,6 +67,12 @@ if TYPE_CHECKING:
 
     ROCK_MODEL_SERVICE_INSTALL_CMD: str
 
+    # Image cleanup
+    ROCK_IMAGE_KEEP_PATTERNS: list[str] = []
+    """Comma-separated regex whitelist of image names that safe_remove_image
+    must NEVER delete. Default protects base images and EnvHub-derived ones.
+    Set to "" to disable the whitelist entirely (NOT recommended)."""
+
 
 environment_variables: dict[str, Callable[[], Any]] = {
     "ROCK_LOGGING_PATH": lambda: os.getenv("ROCK_LOGGING_PATH"),
@@ -138,6 +144,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Docker temp auth directory
     "ROCK_DOCKER_TEMP_AUTH_DIR": lambda: os.getenv("ROCK_DOCKER_TEMP_AUTH_DIR"),
+    # Image cleanup whitelist (comma-separated regex). Empty string disables.
+    "ROCK_IMAGE_KEEP_PATTERNS": lambda: (
+        [p.strip() for p in os.getenv("ROCK_IMAGE_KEEP_PATTERNS").split(",") if p.strip()]
+        if os.getenv("ROCK_IMAGE_KEEP_PATTERNS") is not None
+        else ["^.*envhub.*$", "^rock-base.*$"]
+    ),
 }
 
 

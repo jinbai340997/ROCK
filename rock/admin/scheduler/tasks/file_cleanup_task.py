@@ -1,4 +1,5 @@
 # rock/admin/scheduler/tasks/file_cleanup_task.py
+import os
 from dataclasses import dataclass, field
 
 from rock.admin.proto.request import SandboxCommand as Command
@@ -41,16 +42,36 @@ class TargetDirConfig:
 
         Returns:
             A TargetDirConfig instance
+
+        Raises:
+            ValueError: path is empty / not absolute / contains "..".
         """
         if isinstance(raw, str):
-            return cls(path=raw)
-        if isinstance(raw, dict):
-            return cls(
+            instance = cls(path=raw)
+        elif isinstance(raw, dict):
+            instance = cls(
                 path=raw["path"],
                 exclude_dirs=raw.get("exclude_dirs", []),
                 exclude_files=raw.get("exclude_files", []),
             )
-        raise ValueError(f"Unsupported target_dirs entry type: {type(raw)}")
+        else:
+            raise ValueError(f"Unsupported target_dirs entry type: {type(raw)}")
+
+        cls._validate_path(instance.path)
+        return instance
+
+    @staticmethod
+    def _validate_path(path: str) -> None:
+        """Reject empty / relative / traversal paths to catch yaml typos early."""
+        if not path or not isinstance(path, str):
+            raise ValueError(f"target_dirs path must be a non-empty string, got: {path!r}")
+        if not os.path.isabs(path):
+            raise ValueError(f"target_dirs path must be an absolute path, got: {path!r}")
+        # Check the raw path BEFORE normpath; normpath collapses `..`,
+        # which would mask the original intent. Catching it here forces
+        # operators to write the resolved absolute path explicitly.
+        if ".." in path.split(os.sep):
+            raise ValueError(f"target_dirs path must not contain '..', got: {path!r}")
 
 
 class FileCleanupTask(BaseTask):
@@ -168,10 +189,17 @@ class FileCleanupTask(BaseTask):
     def _build_cleanup_command(self, dir_config: TargetDirConfig) -> str:
         """Build the shell command for cleaning up files in a single directory.
 
-        The command performs two steps:
-        1. Delete files matching either condition: older than max_age_mins OR larger than max_file_size
-           (excluding configured directories and files)
-        2. Remove empty directories left behind (excluding configured directories)
+        Performance:
+            Use ``find ... -delete`` instead of ``-exec rm -f {} +``:
+            -delete calls unlink(2) directly without forking; on dirs
+            with tens of thousands of files this is ~10x faster.
+
+            Same idiom for empty-dir removal: ``-depth -type d -empty -delete``.
+
+        Steps:
+            1. Delete files older than max_age_mins OR larger than max_file_size
+               (with configured exclusions).
+            2. Remove empty directories left behind (with configured exclusions).
 
         Args:
             dir_config: The target directory configuration with its exclusions
@@ -200,9 +228,9 @@ class FileCleanupTask(BaseTask):
             f'find "{target_dir}" {exclude_expr}'
             f"-type f "
             f"\\( -mmin +{self.max_age_mins} -o {size_find_expr} \\) "
-            f"-exec rm -f {{}} +; "
+            f"-delete; "
             f'find "{target_dir}" -depth {dir_exclude_expr}'
-            f"-type d -empty -exec rmdir {{}} +; "
+            f"-type d -empty -delete; "
             f'echo "cleanup_done"; '
             f'else echo "dir_not_found"; fi'
         )
