@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 import logging
 import time
@@ -34,6 +35,9 @@ from rock.admin.gem.api import gem_router, set_env_service
 from rock.admin.scheduler.scheduler import SchedulerThread, WorkerIPCache
 from rock.admin.scheduler.task_base import BaseTask
 from rock.admin.scheduler.task_factory import TaskFactory
+from rock.admin.scheduler.tasks.sandbox_log_archive_task import (
+    set_main_loop_provider as set_archive_main_loop_provider,
+)
 from rock.admin.scheduler.tasks.sandbox_log_archive_task import (
     set_rock_config_provider as set_archive_rock_config_provider,
 )
@@ -114,6 +118,12 @@ async def lifespan(app: FastAPI):
     # config reload propagates to the next task run without re-injection.
     set_archive_sandbox_table_provider(lambda: sandbox_table)
     set_archive_rock_config_provider(lambda: rock_config)
+    # Capture lifespan loop (uvicorn main loop). SandboxLogArchiveTask runs
+    # inside SchedulerThread's child loop; it must dispatch DB calls back to
+    # this main loop so asyncpg pool stays bound here and HTTP handlers don't
+    # break with "Future attached to a different loop".
+    _main_loop = asyncio.get_running_loop()
+    set_archive_main_loop_provider(lambda: _main_loop)
 
     # init ops job table (DB-backed, multi-pod safe) — shared by admin_ops_api router
     ops_job_table = OpsJobTable(db_provider)
