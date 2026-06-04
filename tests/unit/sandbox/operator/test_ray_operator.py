@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -36,6 +36,33 @@ def test_use_rocklet_returns_true_when_switch_is_on(ray_service, runtime_config)
     operator.set_nacos_provider(mock_nacos_provider)
     assert operator.use_rocklet() is True
     mock_nacos_provider.get_switch_status.assert_called_once_with(GET_STATUS_SWITCH)
+
+
+@pytest.mark.asyncio
+async def test_get_remote_status_passes_sandbox_id(runtime_config):
+    """get_remote_status must include sandbox_id in both execute and read_file requests."""
+    ray_service = MagicMock()
+    operator = RayOperator(ray_service=ray_service, runtime_config=runtime_config)
+
+    sandbox_id = "test-sandbox-123"
+    host_ip = "10.0.0.1"
+
+    with patch("rock.sandbox.operator.ray.HttpUtils.post", new_callable=AsyncMock) as mock_post:
+        # First call (execute/ls) returns file exists, second call (read_file) returns content
+        mock_post.side_effect = [
+            {"exit_code": 0, "output": ""},
+            {"content": '{"phases": {}, "port_mapping": {}}'},
+        ]
+
+        status = await operator.get_remote_status(sandbox_id, host_ip)
+
+        assert mock_post.call_count == 2
+        # Verify sandbox_id in execute request
+        execute_call = mock_post.call_args_list[0]
+        assert execute_call.kwargs["data"]["sandbox_id"] == sandbox_id
+        # Verify sandbox_id in read_file request
+        read_call = mock_post.call_args_list[1]
+        assert read_call.kwargs["data"]["sandbox_id"] == sandbox_id
 
 
 @pytest.mark.need_docker
