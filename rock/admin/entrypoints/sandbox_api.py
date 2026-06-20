@@ -32,6 +32,7 @@ from rock.admin.proto.response import SandboxStartResponse
 from rock.common.constants import (
     CPU_OVERCOMMIT_ALLOWED_KEYS_KEY,
     CPU_OVERCOMMIT_HEADROOM_KEY,
+    DIND_MIRROR_PROXY_KEY,
     EXTRA_ACCELERATOR_TYPES_KEY,
     GET_STATUS_SWITCH,
     KATA_DIND_DISK_SIZE_KEY,
@@ -311,6 +312,51 @@ async def _apply_cpu_overcommit_default(config: DockerDeploymentConfig, rock_aut
     config.limit_cpus = min(2 * config.cpus, config.cpus + headroom)
 
 
+async def _apply_dind_mirror_hosts(config: DockerDeploymentConfig) -> None:
+    """Inject ``--add-host`` and ``ROCK_DIND_INSECURE_REGISTRIES`` into Kata (DinD)
+    sandboxes so that inner-layer ``docker pull`` is transparently redirected to a
+    Registry Proxy service instead of reaching the original ACR endpoints.
+
+    Gated by ``config.use_kata_runtime`` (non-Kata sandboxes are skipped) and
+    the Nacos key ``dind_mirror_proxy.enabled``.  When the switch is off or the
+    config is incomplete, the function is a silent no-op — sandbox creation is
+    never blocked.
+    """
+    if not config.use_kata_runtime:
+        return
+
+    nacos = sandbox_manager.rock_config.nacos_provider
+    if nacos is None:
+        return
+
+    nacos_cfg = (await nacos.get_config() or {})
+    dind_mirror_config = nacos_cfg.get(DIND_MIRROR_PROXY_KEY) or {}
+
+    if not dind_mirror_config.get("enabled", False):
+        return
+
+    proxy_ip: str = dind_mirror_config.get("proxy_ip", "")
+    acr_domains: list[str] = dind_mirror_config.get("acr_domains", [])
+
+    if not proxy_ip or not acr_domains:
+        logger.warning("dind_mirror_proxy config incomplete (proxy_ip or acr_domains empty), skip injection")
+        return
+
+    # --add-host: make the DinD Docker daemon resolve ACR domains to the proxy
+    for domain in acr_domains:
+        config.docker_args.extend(["--add-host", f"{domain}:{proxy_ip}"])
+
+    # -e ROCK_DIND_INSECURE_REGISTRIES: consumed by docker_run.sh to merge
+    # insecure-registries into /etc/docker/daemon.json before Docker starts
+    insecure_csv = ",".join(acr_domains)
+    config.docker_args.extend(["-e", f"ROCK_DIND_INSECURE_REGISTRIES={insecure_csv}"])
+
+    logger.info(
+        f"DinD mirror hosts injected: proxy_ip={proxy_ip}, "
+        f"domains={len(acr_domains)}, sandbox={config.container_name}"
+    )
+
+
 @sandbox_router.post("/start")
 @handle_exceptions(error_message="start sandbox failed")
 async def start(request: SandboxStartRequest) -> RockResponse[SandboxStartResponse]:
@@ -320,6 +366,7 @@ async def start(request: SandboxStartRequest) -> RockResponse[SandboxStartRespon
     await _apply_kata_disk_size(config)
     await _apply_disk_limits(config)
     await _apply_image_registry_mirror(config)
+    await _apply_dind_mirror_hosts(config)
     sandbox_start_response = await sandbox_manager.start(config)
     return RockResponse(result=sandbox_start_response)
 
@@ -337,6 +384,7 @@ async def start_async(
     await _apply_cpu_overcommit_default(config, headers.user_info.get("rock_authorization"))
     await _apply_disk_limits(config)
     await _apply_image_registry_mirror(config)
+    await _apply_dind_mirror_hosts(config)
     sandbox_start_response = await sandbox_manager.start_async(
         config,
         user_info=headers.user_info,

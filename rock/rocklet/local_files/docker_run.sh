@@ -45,6 +45,48 @@ setup_kata_dind() {
     mount -o loop /docker-disk.img "$docker_root"
     mount -o remount,rw /sys/fs/cgroup
     mount -o remount,rw /proc/sys
+
+    # Inject insecure-registries for DinD mirror proxy.
+    # ROCK_DIND_INSECURE_REGISTRIES is a comma-separated list of ACR domains
+    # injected by the admin _apply_dind_mirror_hosts() when the proxy is enabled.
+    if [ -n "${ROCK_DIND_INSECURE_REGISTRIES:-}" ]; then
+        local DAEMON_JSON="/etc/docker/daemon.json"
+        # Build a JSON array from the CSV: "a,b" → ["a","b"]
+        local INSECURE_JSON
+        INSECURE_JSON=$(echo "$ROCK_DIND_INSECURE_REGISTRIES" | \
+            tr ',' '\n' | sed 's/^/"/;s/$/"/' | paste -sd',' - | sed 's/^/[/;s/$/]/')
+
+        if [ -f "$DAEMON_JSON" ]; then
+            if command -v jq &>/dev/null; then
+                jq --argjson new "$INSECURE_JSON" \
+                    '.["insecure-registries"] = ((.["insecure-registries"] // []) + $new | unique)' \
+                    "$DAEMON_JSON" > /tmp/daemon.merged.json && mv /tmp/daemon.merged.json "$DAEMON_JSON"
+            elif command -v python3 &>/dev/null; then
+                python3 -c "
+import json
+with open('$DAEMON_JSON') as f: d = json.load(f)
+d.setdefault('insecure-registries', []).extend(json.loads('$INSECURE_JSON'))
+d['insecure-registries'] = list(set(d['insecure-registries']))
+with open('$DAEMON_JSON', 'w') as f: json.dump(d, f, indent=2)
+"
+            elif command -v python &>/dev/null; then
+                python -c "
+import json
+with open('$DAEMON_JSON') as f: d = json.load(f)
+d.setdefault('insecure-registries', []).extend(json.loads('$INSECURE_JSON'))
+d['insecure-registries'] = list(set(d['insecure-registries']))
+with open('$DAEMON_JSON', 'w') as f: json.dump(d, f, indent=2)
+"
+            else
+                echo "WARNING: no jq or python available, creating new daemon.json"
+                echo "{\"insecure-registries\": $INSECURE_JSON}" > "$DAEMON_JSON"
+            fi
+        else
+            mkdir -p /etc/docker
+            echo "{\"insecure-registries\": $INSECURE_JSON}" > "$DAEMON_JSON"
+        fi
+        echo "DinD insecure-registries injected: $ROCK_DIND_INSECURE_REGISTRIES"
+    fi
 }
 
 # Run rocklet
