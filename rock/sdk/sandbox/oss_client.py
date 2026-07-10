@@ -196,28 +196,63 @@ class OssClient:
                 mode=RunMode.NORMAL,
             )
 
-            # wget the signed URL.
-            # Note: NO `-c` (continue/resume). With `-c`, wget skips download
-            # entirely if the local file already exists with size matching the
-            # remote object — but the OSS object name is derived from
-            # (sandbox_id|local_path|sandbox_path), not file content, so a
+            # Download the signed URL inside the sandbox.
+            #
+            # Prefer wget, fall back to curl: not every sandbox image ships
+            # wget (e.g. slim Ubuntu-based images carry only curl). When wget
+            # is missing, a bare `wget ...` exits 127 inside the NOHUP wrapper,
+            # whose exit code is swallowed by the PID-polling completion check,
+            # so the upload would be silently reported as failed/succeeded
+            # without ever fetching the object. The `command -v wget || curl`
+            # fallback keeps working on curl-only images.
+            #
+            # Flags: NO `-c` (continue/resume) on wget. With `-c`, wget skips
+            # the download entirely if a local file already exists with a size
+            # matching the remote object — but the OSS object name is derived
+            # from (sandbox_id|local_path|sandbox_path), not file content, so a
             # repeat upload to the same target re-uses the same OSS key. The
             # remote object IS overwritten by `resumable_upload` above (new
             # content), but `wget -c` would compare sizes, see they match, and
             # exit 0 without fetching, leaving the sandbox file at its old
-            # content while we still report success. `-O` alone forces wget
-            # to truncate and rewrite, regardless of existing local state.
-            download_cmd = f"wget -O {shlex.quote(target_path)} '{url}'"
+            # content while we still report success. `-O` (wget) / `-o` (curl)
+            # force a truncate-and-rewrite regardless of existing local state.
+            # `curl -f` makes HTTP errors (e.g. expired signature) a non-zero
+            # exit instead of writing an error body to disk.
+            # The command is a compound (if/else/fi), but RunMode.NOHUP wraps
+            # it as `nohup {cmd} < /dev/null > file 2>&1 & ...`. A shell
+            # keyword like `if` cannot directly follow `nohup` (it would be a
+            # syntax error near `then`), so wrap the whole thing in
+            # `bash -c <quoted>` — nohup then runs the simple command `bash`.
+            # Both target and URL are shlex-quoted so they survive the extra
+            # bash -c layer and a stray quote in either cannot corrupt the
+            # command or allow injection.
+            quoted_target = shlex.quote(target_path)
+            quoted_url = shlex.quote(url)
+            download_inner = (
+                f"if command -v wget >/dev/null 2>&1; then "
+                f"wget -O {quoted_target} {quoted_url}; "
+                f"else curl -fsSL -o {quoted_target} {quoted_url}; fi"
+            )
+            download_cmd = f"bash -c {shlex.quote(download_inner)}"
             await self._sandbox.arun(cmd=download_cmd, wait_timeout=600, mode=RunMode.NOHUP)
 
-            # Verify target exists in sandbox. Use execute() instead of arun(),
-            # because arun() raises on non-zero exit codes; here exit_code=1
-            # (file missing) is a normal branch we need to inspect.
-            check = await self._sandbox.execute(Command(command=["test", "-f", target_path]))
+            # Verify the download actually landed. Use execute() instead of
+            # arun(), because arun() raises on non-zero exit codes; here a
+            # non-zero exit (file missing / empty) is a normal branch we need
+            # to inspect. NOHUP discards the downloader's own exit code, so
+            # this post-check is the authoritative success signal: the target
+            # must exist AND be non-empty (`test -s`), which rejects the
+            # 0-byte residue left behind when the downloader binary is missing
+            # or the fetch fails early.
+            check = await self._sandbox.execute(Command(command=["test", "-s", target_path]))
             if check.exit_code != 0:
                 return UploadResponse(
                     success=False,
-                    message=f"Failed to upload file {file_name}, sandbox download phase failed",
+                    message=(
+                        f"Failed to upload file {file_name}, sandbox download phase failed "
+                        f"(target missing or empty at {target_path}; "
+                        f"check that the sandbox image provides wget or curl)"
+                    ),
                 )
             return UploadResponse(
                 success=True,

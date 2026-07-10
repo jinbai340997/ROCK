@@ -247,8 +247,9 @@ class TestUploadViaOss:
     async def test_sandbox_verification_fail_returns_failure(self):
         sandbox = _make_sandbox()
         sandbox.sandbox_id = "sb-123"
-        # mkdir/wget go through arun and succeed; the final test -f check goes
-        # through execute() and fails (exit_code=1 = file missing).
+        # mkdir/download go through arun and succeed; the final `test -s` check
+        # (exists AND non-empty) goes through execute() and fails (exit_code=1
+        # = file missing or empty).
         sandbox.arun = AsyncMock(return_value=MagicMock(exit_code=0))
         sandbox.execute = AsyncMock(return_value=MagicMock(exit_code=1))
 
@@ -298,8 +299,10 @@ class TestUploadViaOss:
         )
         wget_cmd = wget_call.kwargs.get("cmd") or wget_call.args[0]
         # The bug was `wget -c -O ...` — `-c` makes wget skip a same-sized local file.
-        assert " -c " not in f" {wget_cmd} ", f"wget should not use -c: {wget_cmd!r}"
-        assert " -O " in wget_cmd, f"wget must use -O to force overwrite: {wget_cmd!r}"
+        # Match `wget -c` specifically; the outer `bash -c` wrapper legitimately
+        # contains " -c ".
+        assert "wget -c" not in wget_cmd, f"wget should not use -c: {wget_cmd!r}"
+        assert "wget -O " in wget_cmd, f"wget must use -O to force overwrite: {wget_cmd!r}"
 
     async def test_wget_command_quotes_target_path(self):
         """target_path is interpolated into a shell command; if it contains
@@ -357,7 +360,65 @@ class TestUploadViaOss:
         ]
         assert len(wget_calls) == 2
         for wget_cmd in wget_calls:
-            assert " -c " not in f" {wget_cmd} ", f"`-c` regressed: {wget_cmd!r}"
+            # Match `wget -c` specifically; the outer `bash -c` wrapper
+            # legitimately contains " -c ".
+            assert "wget -c" not in wget_cmd, f"`-c` regressed: {wget_cmd!r}"
+
+    async def test_download_cmd_falls_back_to_curl_when_wget_missing(self):
+        """Regression: not every sandbox image ships wget (e.g. slim
+        Ubuntu-based images carry only curl). The download command must try
+        wget first and fall back to curl, otherwise a missing wget makes the
+        large-file upload silently fail with an empty target file."""
+        sandbox = _make_sandbox()
+        sandbox.sandbox_id = "sb-123"
+        sandbox.arun = AsyncMock(return_value=MagicMock(exit_code=0))
+        sandbox.execute = AsyncMock(return_value=MagicMock(exit_code=0))
+
+        client = OssClient(sandbox)
+        client._bucket = MagicMock()
+        client._bucket.sign_url = MagicMock(return_value="https://oss/signed?token=xxx")
+
+        with patch("rock.sdk.sandbox.oss_client.oss2.resumable_upload"):
+            await client.upload_via_oss("/local/foo.json", "/sandbox/dst/foo.json")
+
+        dl_call = next(
+            c for c in sandbox.arun.await_args_list
+            if "wget" in (c.kwargs.get("cmd") or (c.args[0] if c.args else ""))
+        )
+        dl_cmd = dl_call.kwargs.get("cmd") or dl_call.args[0]
+        # Must be wrapped in `bash -c`: RunMode.NOHUP prepends `nohup `, and a
+        # bare `if` keyword cannot follow nohup (syntax error near `then`).
+        assert dl_cmd.startswith("bash -c "), f"compound cmd must be bash -c wrapped: {dl_cmd!r}"
+        # wget branch (guarded) + curl fallback branch must both be present.
+        assert "command -v wget" in dl_cmd, f"missing wget guard: {dl_cmd!r}"
+        assert "wget -O " in dl_cmd, f"missing wget -O branch: {dl_cmd!r}"
+        assert "curl -fsSL -o " in dl_cmd, f"missing curl fallback: {dl_cmd!r}"
+
+    async def test_verification_uses_test_s_to_reject_empty_file(self):
+        """Regression: NOHUP discards the downloader exit code, so a missing
+        binary (wget exit 127) or a failed fetch can leave a 0-byte file. The
+        post-download check must use `test -s` (exists AND non-empty), not a
+        bare `test -f`, so an empty residue is treated as a failure."""
+        sandbox = _make_sandbox()
+        sandbox.sandbox_id = "sb-123"
+        sandbox.arun = AsyncMock(return_value=MagicMock(exit_code=0))
+        # File exists but is empty → `test -s` returns non-zero → failure.
+        sandbox.execute = AsyncMock(return_value=MagicMock(exit_code=1))
+
+        client = OssClient(sandbox)
+        client._bucket = MagicMock()
+        client._bucket.sign_url = MagicMock(return_value="https://oss/signed")
+
+        with patch("rock.sdk.sandbox.oss_client.oss2.resumable_upload"):
+            response = await client.upload_via_oss("/local/foo.json", "/sandbox/dst/foo.json")
+
+        assert response.success is False
+        assert "sandbox download phase failed" in response.message
+        # The verification must be `test -s <target>` (non-empty), not `test -f`.
+        verify_call = sandbox.execute.await_args
+        cmd_obj = verify_call.args[0]
+        assert cmd_obj.command == ["test", "-s", "/sandbox/dst/foo.json"], \
+            f"verification must use `test -s`: {cmd_obj.command!r}"
 
 
 class TestDownloadViaOss:
